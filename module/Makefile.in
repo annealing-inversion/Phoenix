@@ -71,10 +71,13 @@ refresh-pat-snapshot:
 insmod: refresh-pat-snapshot
 	sudo insmod phoenixfs.ko $(if $(strip $(MAP_MODE)),phxfs_map_mode=$(strip $(MAP_MODE)),) $(if $(strip $(DEBUG_MODE)),phxfs_debug=$(strip $(DEBUG_MODE)),)
 # Named targets so the mode is TAB-completable (make completes target names,
-# not VAR=val assignments).
+# not VAR=val assignments). Their mode is fixed; a conflicting MAP_MODE is
+# rejected instead of being silently ignored.
 insmod-staging: refresh-pat-snapshot
+	@case "$(strip $(MAP_MODE))" in ""|1) ;; *) echo ">> insmod-staging always loads phxfs_map_mode=1; conflicting MAP_MODE=$(strip $(MAP_MODE))" >&2; exit 1;; esac
 	sudo insmod phoenixfs.ko phxfs_map_mode=1 $(if $(strip $(DEBUG_MODE)),phxfs_debug=$(strip $(DEBUG_MODE)),)
 insmod-full: refresh-pat-snapshot
+	@case "$(strip $(MAP_MODE))" in ""|0) ;; *) echo ">> insmod-full always loads phxfs_map_mode=0; conflicting MAP_MODE=$(strip $(MAP_MODE))" >&2; exit 1;; esac
 	sudo insmod phoenixfs.ko phxfs_map_mode=0 $(if $(strip $(DEBUG_MODE)),phxfs_debug=$(strip $(DEBUG_MODE)),)
 rmmod:
 	sudo rmmod phoenixfs

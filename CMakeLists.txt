@@ -207,20 +207,22 @@ add_custom_target(
     insmod
     # Optional override: `make insmod MAP_MODE=0|1` forces the BAR map mode for
     # this load, overriding the mode baked in at cmake time (PHXFS_MAP_MODE).
-    COMMAND sudo make insmod MAP_MODE=$(MAP_MODE)
+    # Variables are passed explicitly: sudo may reset the environment, which
+    # would drop make's implicit MAKEFLAGS propagation.
+    COMMAND sudo make insmod MAP_MODE=$(MAP_MODE) DEBUG_MODE=$(DEBUG_MODE)
     WORKING_DIRECTORY ${module_output}
     COMMENT "Inserting kernel module"
 )
 # Named variants so the mode is TAB-completable at the top level too.
 add_custom_target(
     insmod-staging
-    COMMAND sudo make insmod-staging
+    COMMAND sudo make insmod-staging MAP_MODE=$(MAP_MODE) DEBUG_MODE=$(DEBUG_MODE)
     WORKING_DIRECTORY ${module_output}
     COMMENT "Inserting kernel module (STAGING mode)"
 )
 add_custom_target(
     insmod-full
-    COMMAND sudo make insmod-full
+    COMMAND sudo make insmod-full MAP_MODE=$(MAP_MODE) DEBUG_MODE=$(DEBUG_MODE)
     WORKING_DIRECTORY ${module_output}
     COMMENT "Inserting kernel module (FULL mode)"
 )
