@@ -550,7 +550,10 @@ static int host_batch_prepare(phxfs_io_req_t *reqs, int n,
 
                 phxfs_io_op_req op{};
                 op.fd = reqs[i].fd;
-                op.host_addr = base;
+                /* HOST-device slices get a pinned buffer from host_prepare();
+                 * CPU-buffer slices DMA straight to this address, so it must
+                 * carry the slice offset like gpu_addr/file_offset do. */
+                op.host_addr = (char *)base + off;
                 op.nbytes = piece;
                 op.f_offset = slice.file_offset;
                 op.result = -EFAULT;

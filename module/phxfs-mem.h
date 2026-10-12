@@ -4,12 +4,16 @@
 #include <linux/types.h>
 #include <linux/mm.h>
 #include <linux/file.h>
+#include <linux/mutex.h>
 #include "phxfs.h" 
 
-#define PAGE_SHIFT 12
-
 struct phxfs_mmap_buffer {
-    atomic_t ref;   /* one reference per VMA that carries this buffer */
+    atomic_t ref;   /* one reference per VMA that carries this buffer, plus
+                     * one per in-flight MAP/UNMAP ioctl */
+    struct mutex lock; /* serializes MAP/UNMAP on this buffer */
+    bool consumed;  /* BAR pages were inserted into the VMA at least once.
+                     * Those PTEs live until the VMA goes away, so the VMA
+                     * cannot host a second mapping. */
     u64 c_vaddr; // mmap cpu vaddr
     u64 map_len; // mmap len
     u64 n_vaddr; // allocated by cann api
@@ -30,7 +34,7 @@ struct phxfs_mmap_buffer {
 typedef struct phxfs_mmap_buffer* phxfs_mmap_buffer_t;
 
 int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t pbuffer, u64 devaddr, u64 dev_len);
-int phxfs_map_dev_addr(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length);
+int phxfs_map_dev_addr(struct file *filp, phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length);
 int phxfs_mmap(struct file *filp, struct vm_area_struct *vma);
 void phxfs_mbuffer_put(phxfs_mmap_buffer_t pbuffer);
 

@@ -59,26 +59,30 @@ int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
 	}
 	buf[ret] = '\0';
 
-	/* Parse lines like: "write-combining @ 0x21a000800000-0x21a000900000" */
+	/*
+	 * Two line formats, both with an exclusive end:
+	 *   >= 5.5: "PAT: [mem 0x000021a000080000-0x000021a000090000] write-combining"
+	 *   older : "write-combining @ 0x21a000800000-0x21a000900000"
+	 * plus a "PAT memtype list:" header that matches neither.
+	 */
 	{
 		char *line = buf;
 		while (line && *line) {
 			char *nl = strchr(line, '\n');
 			u64 cs, ce;
 			char memtype[64] = {0};
+			bool parsed;
 
 			if (nl)
 				*nl = '\0';
 
-			/* Skip write-back entries - they don't conflict with cached mapping */
-			if (strncmp(line, "write-back", 10) == 0 ||
-			    strncmp(line, "PAT", 3) == 0) {
-				line = nl ? nl + 1 : NULL;
-				continue;
-			}
+			parsed = sscanf(line, "PAT: [mem 0x%llx-0x%llx] %63s",
+					&cs, &ce, memtype) == 3 ||
+				 sscanf(line, "%63s @ 0x%llx-0x%llx",
+					memtype, &cs, &ce) == 3;
 
-			/* Try to parse: <memtype> @ 0x<start>-0x<end> */
-			if (sscanf(line, "%63s @ 0x%llx-0x%llx", memtype, &cs, &ce) == 3) {
+			/* Write-back entries don't conflict with a cached mapping */
+			if (parsed && strcmp(memtype, "write-back") != 0) {
 				/* Check if this range overlaps with our BAR window */
 				if (cs < bar_end && ce > bar_start) {
 					/* Clip to BAR range */
@@ -204,6 +208,16 @@ static void force_release_gpu_memory(struct p2p_vmap* map)
     if (WARN_ON(!map))
         return;
 
+    /*
+     * The vendor may fire this as soon as it has registered the callback,
+     * i.e. before get_pages() has even returned to phxfs_map_dev_addr_inner()
+     * (NVIDIA registers it as the last step of nv_p2p_get_pages()), and it
+     * frees its own page table right after we return. Hold the vendor off
+     * until registration has published gd->pt and finished reading the page
+     * table; from then on the ownership protocol below is sufficient.
+     */
+    wait_for_completion(&map->reg_done);
+
     if (atomic_cmpxchg(&map->callback_state, PHXFS_CALLBACK_LIVE,
                        PHXFS_CALLBACK_RUNNING) != PHXFS_CALLBACK_LIVE)
         return;
@@ -229,47 +243,73 @@ static void force_release_gpu_memory(struct p2p_vmap* map)
 	p2p_vmap_put(map);  /* registered reclaim callback */
 }
 
-phxfs_mmap_buffer_t phxfs_check_and_bind_phony_buffer(u64 cpuvaddr, u64 length) { 
-    phxfs_mmap_buffer_t mbuffer = NULL; 
-    struct mm_struct *mm = current->mm; 
-    struct vm_area_struct *vma; 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+static inline void mmap_read_lock(struct mm_struct *mm) { down_read(&mm->mmap_sem); }
+static inline void mmap_read_unlock(struct mm_struct *mm) { up_read(&mm->mmap_sem); }
+#endif
 
-    if (!cpuvaddr) { 
-        phxfs_err("phxfs_check_and_bind_phony_buffer get cpuvaddr error\n");
-        goto out; 
-    } 
+static const struct vm_operations_struct phxfs_vm_ops;
+void phxfs_mbuffer_get_ref(phxfs_mmap_buffer_t mbuffer);
 
-    if (cpuvaddr % PAGE_SIZE) { 
-        phxfs_err("phxfs_check_and_bind_phony_buffer cpuvaddr not aligned\n");
-        goto out; 
-    } 
+/*
+ * The phony-buffer VMA that exactly covers [addr, addr + len), or NULL. Only
+ * VMAs created by phxfs_mmap() qualify, so another driver's vm_private_data is
+ * never reinterpreted as a phony buffer. Caller holds mmap_lock.
+ */
+static struct vm_area_struct *phxfs_find_phony_vma(struct mm_struct *mm,
+                                                   u64 addr, u64 len)
+{
+    struct vm_area_struct *vma = find_vma(mm, addr);
 
-    vma = find_vma(mm, cpuvaddr); 
-    if (vma == NULL)
-        goto out; 
-        
+    if (!vma || vma->vm_start != addr || vma->vm_end - vma->vm_start != len ||
+        vma->vm_ops != &phxfs_vm_ops)
+        return NULL;
+    return vma;
+}
 
-    mbuffer = (phxfs_mmap_buffer_t)vma->vm_private_data; 
-    if (mbuffer!= NULL) { 
-        if (mbuffer->c_vaddr!= cpuvaddr || mbuffer->map_len!= length) { 
-            phxfs_warn("reg region is not same as mmap region\n");
-            goto out; 
-        } else { 
-            return mbuffer; 
-        } 
-    } else { 
-        phxfs_warn("vma found, but mbuffer is none!\n");
-        goto out; 
-    } 
+/*
+ * Look up the phony buffer behind the caller's mapping [cpuvaddr, +length)
+ * on device `dev` and take a reference on it, so it survives a concurrent
+ * munmap() once mmap_lock is dropped. Release with phxfs_mbuffer_put().
+ */
+static phxfs_mmap_buffer_t phxfs_get_phony_buffer(struct phxfs_dev *dev,
+                                                  u64 cpuvaddr, u64 length)
+{
+    phxfs_mmap_buffer_t mbuffer = NULL;
+    struct mm_struct *mm = current->mm;
+    struct vm_area_struct *vma;
 
-out: 
-    return NULL; 
-} 
+    if (!mm || !cpuvaddr || !length) {
+        phxfs_err("phxfs: phony buffer lookup: bad address/length\n");
+        return NULL;
+    }
+    if (cpuvaddr % PAGE_SIZE) {
+        phxfs_err("phxfs: phony buffer lookup: cpuvaddr not aligned\n");
+        return NULL;
+    }
+
+    mmap_read_lock(mm);
+    vma = phxfs_find_phony_vma(mm, cpuvaddr, length);
+    if (vma) {
+        mbuffer = (phxfs_mmap_buffer_t)vma->vm_private_data;
+        if (mbuffer && mbuffer->dev == dev && mbuffer->c_vaddr == cpuvaddr &&
+            mbuffer->map_len == length)
+            phxfs_mbuffer_get_ref(mbuffer);
+        else
+            mbuffer = NULL;
+    }
+    mmap_read_unlock(mm);
+
+    if (!mbuffer)
+        phxfs_warn("reg region is not same as mmap region\n");
+    return mbuffer;
+}
 
 int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_len) {
     struct phxfs_dev *dev = NULL;
     struct gpu_region* gd = NULL;
     struct vm_area_struct *vma;
+    struct mm_struct *mm = current->mm;
     u64 *dev_page_addrs = NULL;
     u64 page_size;
     u64 nr_dev_pages;
@@ -278,13 +318,18 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     unsigned long total_pages;
     unsigned long k;
     bool pages_pinned = false;
+    bool keep_span = false;
     int ret = 0, i, j;
 
     if (!mbuffer)
         return -EINVAL;
 
-    vma = mbuffer->vma;
     page_size = phxfs_p2p->page_size;
+    if (page_size < PAGE_SIZE || page_size % PAGE_SIZE != 0) {
+        phxfs_err("phxfs: backend page size %llu is not a multiple of PAGE_SIZE\n",
+                  page_size);
+        return -EINVAL;
+    }
     mbuffer->subpage_num = page_size / PAGE_SIZE;
     dev = mbuffer->dev;
     
@@ -316,6 +361,19 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     }else{
         mbuffer->host_page_num = nr_dev_pages * (mbuffer->subpage_num);
     }
+    /*
+     * host_page_num is how many host pages get inserted into the VMA. Make
+     * sure all of them fit before pinning anything: vm_insert_page() past
+     * vm_end would fail half way with PTEs already in.
+     * (The caller bounds dev_len by map_len, so this cannot overflow.)
+     */
+    if (mbuffer->host_page_num > (mbuffer->map_len >> PAGE_SHIFT)) {
+        phxfs_err("phxfs: registration of %llu bytes needs %lu host pages, "
+                  "mapping only has %llu\n", dev_len, mbuffer->host_page_num,
+                  mbuffer->map_len >> PAGE_SHIFT);
+        ret = -EINVAL;
+        goto out;
+    }
     
     /*
      * The arrays below scale linearly with the registered region size.
@@ -331,10 +389,14 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
         goto out;
     }
 
-    mbuffer->ppages = (struct page **) kvmalloc_array(mbuffer->host_page_num,
+    /* The fill loop below writes subpage_num entries for every device page,
+     * which is more than host_page_num when dev_len < page_size: size the
+     * array for what is written, not for what is inserted. */
+    mbuffer->ppages = (struct page **) kvmalloc_array(nr_dev_pages * mbuffer->subpage_num,
                                                       sizeof(struct page *), GFP_KERNEL);
     if (mbuffer->ppages == NULL) {
-        phxfs_err("Failed to allocate ppages array (%lu entries)\n", mbuffer->host_page_num);
+        phxfs_err("Failed to allocate ppages array (%llu entries)\n",
+                  nr_dev_pages * mbuffer->subpage_num);
         ret = -ENOMEM;
         goto out;
     }
@@ -351,6 +413,7 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
 
     refcount_set(&mbuffer->map->refs, 2);
     atomic_set(&mbuffer->map->callback_state, PHXFS_CALLBACK_LIVE);
+    init_completion(&mbuffer->map->reg_done);
     mbuffer->map->page_size = page_size;
     mbuffer->map->size = dev_len;
     mbuffer->map->gpuvaddr = devaddr;
@@ -367,15 +430,22 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     mbuffer->map->data = (void*)gd;
     ret = phxfs_p2p->get_pages(mbuffer->map->gpuvaddr, page_size * mbuffer->map->n_addrs, &gd->pt, 
         (void (*)(void*)) force_release_gpu_memory, mbuffer->map);
+    /*
+     * A reclaim callback that fired in the meantime is parked on reg_done
+     * (see force_release_gpu_memory), so gd and the vendor page table stay
+     * valid until complete_all() below. Do not touch gd after it.
+     */
     if (gd->pt != NULL)
         pages_pinned = true;
-    if (ret != 0 || gd->pt == NULL) {
+    if (ret == 0 && pages_pinned)
+        ret = phxfs_p2p->get_phys_addrs(gd->pt, dev_page_addrs, mbuffer->map->n_addrs);
+    else if (ret == 0)
+        ret = -ENOMEM;
+    complete_all(&mbuffer->map->reg_done);
+    if (!pages_pinned) {
         phxfs_err("phxfs_p2p->get_pages failed, ret=%d\n", ret);
-        if (ret == 0)
-            ret = -ENOMEM;
         goto out;
     }
-    ret = phxfs_p2p->get_phys_addrs(gd->pt, dev_page_addrs, mbuffer->map->n_addrs);
     if (ret) {
         phxfs_err("get_phys_addrs failed, ret=%d\n", ret);
         goto out;
@@ -426,26 +496,45 @@ int phxfs_map_dev_addr_inner(phxfs_mmap_buffer_t mbuffer, u64 devaddr, u64 dev_l
     }
     mutex_unlock(&dev->seg_lock);
 
-
+    /*
+     * Insert under mmap_lock, into the VMA as it is *now*: the caller dropped
+     * the lock while pinning, so the original VMA may have been unmapped,
+     * split or moved. Read mode suffices: the VMA is VM_MIXEDMAP and
+     * insert_page() serialises on the PTE lock, exactly like a fault.
+     */
+    mmap_read_lock(mm);
+    vma = phxfs_find_phony_vma(mm, mbuffer->c_vaddr, mbuffer->map_len);
+    if (!vma || vma->vm_private_data != mbuffer) {
+        mmap_read_unlock(mm);
+        phxfs_err("phxfs: phony mapping went away during registration\n");
+        ret = -EFAULT;
+        goto out;
+    }
     for (k = 0; k < total_pages; k++) {
         ret = vm_insert_page(vma,
                              mbuffer->c_vaddr + k * PAGE_SIZE,
                              mbuffer->ppages[k]);
-        if (ret) {
-            phxfs_err("vm_insert_page failed, k=%lu, ret=%d\n", k, ret);
-            goto out;
-        }
+        if (ret)
+            break;
     }
-
-    /**
-
-    ret = vm_insert_pages(vma, mbuffer->c_vaddr, mbuffer->ppages, &total_pages);
-    
-    if (ret && total_pages) {
-        printk("vm_insert_pages failed\n");
+    mmap_read_unlock(mm);
+    if (ret) {
+        phxfs_err("vm_insert_page failed, k=%lu, ret=%d\n", k, ret);
+        if (k > 0) {
+            /*
+             * Modules cannot zap a VM_MIXEDMAP range, so the k PTEs already
+             * inserted stay until the VMA is torn down. They keep their BAR
+             * pages busy: hold the staging span until phxfs_mbuffer_free()
+             * (VMA close) instead of handing it to the release worker now,
+             * and refuse any further MAP on this VMA.
+             */
+            mbuffer->consumed = true;
+            keep_span = true;
+        }
         goto out;
     }
-    **/
+
+    mbuffer->consumed = true;
     mbuffer->remap = 1;
     return 0;
 
@@ -480,8 +569,9 @@ out:
         kvfree(dev_page_addrs);
         mbuffer->dev_page_addrs = NULL;
     }
-    /* Give back the staging span this attempt referenced. */
-    if (mbuffer->staging_span != 0) {
+    /* Give back the staging span this attempt referenced, unless PTEs into
+     * it were left behind (then the VMA teardown gives it back). */
+    if (mbuffer->staging_span != 0 && !keep_span) {
         phxfs_staging_put_span(dev, mbuffer->staging_span);
         mbuffer->staging_span = 0;
     }
@@ -489,20 +579,39 @@ out:
     return ret;
 }
 
-int phxfs_map_dev_addr(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length) {
-    int ret = -EINVAL;
+int phxfs_map_dev_addr(struct file *filp, phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length) {
+    int ret;
     phxfs_mmap_buffer_t mbuffer;
-    
-    mbuffer = phxfs_check_and_bind_phony_buffer(cpuvaddr, length);
-    if (mbuffer == NULL || mbuffer->vma == NULL || devaddr <= length) {
-        return ret;
+
+    mbuffer = phxfs_get_phony_buffer((struct phxfs_dev *)filp->private_data,
+                                     cpuvaddr, length);
+    if (mbuffer == NULL)
+        return -EINVAL;
+
+    if (devaddr == 0 || dev_len == 0 || dev_len > mbuffer->map_len) {
+        phxfs_err("phxfs: bad MAP request: devaddr=0x%llx dev_len=%llu map_len=%llu\n",
+                  devaddr, dev_len, mbuffer->map_len);
+        ret = -EINVAL;
+        goto put;
+    }
+
+    mutex_lock(&mbuffer->lock);
+    if (mbuffer->remap || mbuffer->consumed) {
+        /* The BAR PTEs of the earlier MAP stay in the VMA until it is
+         * unmapped, so it cannot be mapped again (and silently re-mapping
+         * would leak the earlier pin, arrays and span reference). */
+        phxfs_err("phxfs: phony buffer 0x%llx is already mapped; mmap a new one\n",
+                  cpuvaddr);
+        ret = -EBUSY;
     } else {
-        ret = 0;
         mbuffer->n_vaddr = devaddr;
         mbuffer->dev_len = dev_len;
         ret = phxfs_map_dev_addr_inner(mbuffer, devaddr, dev_len);
-        return ret;
     }
+    mutex_unlock(&mbuffer->lock);
+put:
+    phxfs_mbuffer_put(mbuffer);
+    return ret;
 }
 
 /*
@@ -524,10 +633,17 @@ static void phxfs_mbuffer_unpin(phxfs_mmap_buffer_t mbuffer) {
  * still inserted in that VMA, and unmapping a BAR unit while a page table
  * still references its pages would block forever in memunmap_pages().
  */
-void phxfs_map_dev_release(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length) {
+void phxfs_map_dev_release(struct file *filp, phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length) {
     phxfs_mmap_buffer_t mbuffer;
-    mbuffer = phxfs_check_and_bind_phony_buffer(cpuvaddr, length);
+
+    mbuffer = phxfs_get_phony_buffer((struct phxfs_dev *)filp->private_data,
+                                     cpuvaddr, length);
+    if (mbuffer == NULL)
+        return;
+    mutex_lock(&mbuffer->lock);
     phxfs_mbuffer_unpin(mbuffer);
+    mutex_unlock(&mbuffer->lock);
+    phxfs_mbuffer_put(mbuffer);
 }
 
 static void phxfs_mbuffer_free(phxfs_mmap_buffer_t mbuffer) {
@@ -578,6 +694,7 @@ static void phxfs_mbuffer_put_internal(phxfs_mmap_buffer_t mbuffer) {
     
     if (phxfs_mbuffer_put_ref(mbuffer)) {
         phxfs_mbuffer_free(mbuffer);
+        mutex_destroy(&mbuffer->lock);
         kfree(mbuffer);
     }
 }
@@ -614,6 +731,8 @@ int phxfs_add_phony_buffer(struct file *filp, struct vm_area_struct *vma) {
     }
 
     atomic_set(&phxfs_mbuffer->ref, 1);
+    mutex_init(&phxfs_mbuffer->lock);
+    phxfs_mbuffer->consumed = false;
     phxfs_mbuffer->vma = vma;
     phxfs_mbuffer->dev = dev;
     phxfs_mbuffer->dev_id = dev->idx;
@@ -666,6 +785,9 @@ int phxfs_mmap(struct file *filp, struct vm_area_struct *vma) {
     vma->vm_flags &= ~VM_IO;
     vma->vm_flags |= VM_MIXEDMAP;
     vma->vm_flags |= mm->def_flags;
+    /* The phony buffer is sized at mmap() time (map_len) and maps device
+     * BAR pages: it must not grow under mremap(), nor be read by a core dump. */
+    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
 #else
     unsigned long vm_flags;
     vm_flags = ACCESS_PRIVATE(vma, __vm_flags);
@@ -673,6 +795,7 @@ int phxfs_mmap(struct file *filp, struct vm_area_struct *vma) {
     vm_flags &= ~VM_IO;
     vm_flags |= VM_MIXEDMAP;
     vm_flags |= mm->def_flags;
+    vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
     vm_flags_set(vma, vm_flags);
 #endif
     vma->vm_pgoff = 0;

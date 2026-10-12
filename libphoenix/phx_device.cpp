@@ -75,6 +75,8 @@ int phx_probe_direct_device(int device_id) {
  * reg/dereg/batch synchronise per-device on mbuffer[].lock instead.
  */
 static pthread_mutex_t g_open_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Signalled (under g_open_lock) when a device's `opening` phase ends. */
+static pthread_cond_t g_open_cv = PTHREAD_COND_INITIALIZER;
 
 /* Initialise per-device sync primitives + state once, before any open. */
 __attribute__((constructor))
@@ -85,6 +87,7 @@ static void phxfs_dev_ctor(void) {
         mbuffer[i].init_stat  = false;
         mbuffer[i].phxfs_device_id = -1;
         mbuffer[i].closing    = false;
+        mbuffer[i].opening    = false;
         mbuffer[i].open_count = 0;
         mbuffer[i].active_ops = 0;
         mbuffer[i].head       = NULL;
@@ -181,6 +184,27 @@ static void __phxfs_close_drain(phxfs_mmap_buffer_t *pb) {
     __phxfs_teardown(pb);
 }
 
+/*
+ * Drop the last client reference of an OPEN device: flip it to closing under
+ * g_open_lock (which the caller holds and this releases), then drain and tear
+ * down outside it.
+ */
+static void phx_close_last_unlock(phxfs_mmap_buffer_t *pb, int device_id) {
+    pb->open_count = 0;
+    phxfs_initialized[device_id] = false;
+    /* Set closing under pb->lock before flipping init_stat, so open()'s
+     * EBUSY check is watertight (no window where init_stat==false but
+     * closing==false). Lock order g_open_lock -> pb->lock is safe: dev ops
+     * never take g_open_lock. */
+    pthread_mutex_lock(&pb->lock);
+    pb->closing = true;
+    pb->init_stat = false;
+    pthread_mutex_unlock(&pb->lock);
+    pthread_mutex_unlock(&g_open_lock);
+
+    __phxfs_close_drain(pb);  /* drain (wait active_ops==0) + teardown, outside g_open_lock */
+}
+
 int phxfs_close(int device_id) {
     if (device_id < 0 || device_id >= g_device_count)
         return -1;
@@ -199,6 +223,9 @@ int phxfs_close(int device_id) {
      * after close has committed to teardown.
      */
     pthread_mutex_lock(&g_open_lock);
+    /* A fresh open of this device is still setting up; let it settle. */
+    while (pb->opening)
+        pthread_cond_wait(&g_open_cv, &g_open_lock);
     if (!pb->init_stat) {
         pthread_mutex_unlock(&g_open_lock);
         return -1;
@@ -209,20 +236,18 @@ int phxfs_close(int device_id) {
         pthread_mutex_unlock(&g_open_lock);
         return 0;
     }
-    pb->open_count = 0;
-    phxfs_initialized[device_id] = false;
-    /* Set closing under pb->lock before flipping init_stat, so open()'s
-     * EBUSY check is watertight (no window where init_stat==false but
-     * closing==false). Lock order g_open_lock -> pb->lock is safe: dev ops
-     * never take g_open_lock. */
-    pthread_mutex_lock(&pb->lock);
-    pb->closing = true;
-    pb->init_stat = false;
-    pthread_mutex_unlock(&pb->lock);
-    pthread_mutex_unlock(&g_open_lock);
-
-    __phxfs_close_drain(pb);  /* drain (wait active_ops==0) + teardown, outside g_open_lock */
+    phx_close_last_unlock(pb, device_id);
     return 0;
+}
+
+/* Undo a fresh open whose post-open setup failed. Runs in the opener while
+ * pb->opening is set, so it still owns the one and only client reference. */
+static void phx_open_abort(phxfs_mmap_buffer_t *pb, int device_id) {
+    pthread_mutex_lock(&g_open_lock);
+    if (pb->init_stat)
+        phx_close_last_unlock(pb, device_id);
+    else
+        pthread_mutex_unlock(&g_open_lock);
 }
 
 /* Open the char device. lock/drain_cv are process-lifetime (see ctor). */
@@ -248,6 +273,8 @@ static int __phxfs_open(const char *dev_path, phxfs_mmap_buffer_t *mbuffer,
     return 0;
 }
 
+static int phx_open_finish(int deviceID, phxfs_mmap_buffer_t *pb);
+
 /*
  * Open a phxfs device, or add a client reference if another caller already
  * has it open. g_open_lock makes concurrent phxfs_open() from multiple
@@ -261,6 +288,10 @@ int phxfs_open(int deviceID) {
     PHX_RANGE("phx.open");
 
     pthread_mutex_lock(&g_open_lock);
+    /* Another thread is finishing a fresh open of this device: wait for its
+     * outcome rather than piggy-backing on a half-initialised device. */
+    while (pb->opening)
+        pthread_cond_wait(&g_open_cv, &g_open_lock);
     int ret = 0;
     bool fresh_open = false;
     if (pb->init_stat) {
@@ -304,16 +335,36 @@ int phxfs_open(int deviceID) {
             ret = -ENODEV;
         }
     }
+    /* The post-open steps below run outside g_open_lock (they call into the
+     * device runtime), so fence this device off until they are done: no other
+     * open() can join it and no close() can tear it down underneath. */
+    if (ret == 0 && fresh_open)
+        pb->opening = true;
     pthread_mutex_unlock(&g_open_lock);
 
-    if (ret == 0 && fresh_open && phx_host_mode_auto() &&
-        pb->map_mode == PHX_MAP_MODE_FULL) {
+    if (ret == 0 && fresh_open) {
+        ret = phx_open_finish(deviceID, pb);
+        pthread_mutex_lock(&g_open_lock);
+        pb->opening = false;
+        pthread_cond_broadcast(&g_open_cv);
+        pthread_mutex_unlock(&g_open_lock);
+    }
+    return ret;
+}
+
+/*
+ * Post-open setup of a fresh open: auto-mode direct probe (with host-staging
+ * fallback) and the staging pools. Called with pb->opening set; on failure
+ * the device is torn down again and a negative errno returned.
+ */
+static int phx_open_finish(int deviceID, phxfs_mmap_buffer_t *pb) {
+    if (phx_host_mode_auto() && pb->map_mode == PHX_MAP_MODE_FULL) {
         int probe = phx_probe_direct_device(deviceID);
         if (probe != 0) {
             fprintf(stderr,
                     "phxfs_open: direct probe failed on CUDA device %d (%d); "
                     "using host staging fallback\n", deviceID, probe);
-            phxfs_close(deviceID);
+            phx_open_abort(pb, deviceID);
             pthread_mutex_lock(&g_open_lock);
             pb->bdev_fd = -1;
             pb->device_id = deviceID;
@@ -332,27 +383,27 @@ int phxfs_open(int deviceID) {
         }
     }
 
-    if (ret == 0 && fresh_open && pb->map_mode == PHX_MAP_MODE_HOST) {
+    if (pb->map_mode == PHX_MAP_MODE_HOST) {
         int src = phx_host_staging_setup(deviceID);
         if (src != 0) {
             fprintf(stderr, "phxfs_open: host staging setup failed on CUDA device %d: %d\n",
                     deviceID, src);
-            phxfs_close(deviceID);
+            phx_open_abort(pb, deviceID);
             return src;
         }
     }
 
-    if (ret == 0 && fresh_open && pb->map_mode == PHX_MAP_MODE_STAGING) {
+    if (pb->map_mode == PHX_MAP_MODE_STAGING) {
         int src = phx_staging_setup(deviceID);
         if (src != 0) {
             fprintf(stderr, "phxfs_open: staging setup failed on CUDA device %d: %d\n",
                     deviceID, src);
-            phxfs_close(deviceID);
+            phx_open_abort(pb, deviceID);
             return src;
         }
     }
 
-    return ret;
+    return 0;
 }
 
 int phxfs_find_dev(int device_id) {

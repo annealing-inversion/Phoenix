@@ -25,9 +25,67 @@
  * which is why phxfs_p2pdma_setup() is a no-op there.
  */
 
+#include <linux/sched.h>
 #include <linux/vmalloc.h>
 
 #include "phxfs.h"
+
+static void pgmap_range_of(struct dev_pagemap *pg, u64 *start, u64 *end)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	*start = pg->range.start;
+	*end = pg->range.end;
+#else
+	*start = pg->res.start;
+	*end = pg->res.end;
+#endif
+}
+
+/*
+ * ZONE_DEVICE memory is hot-added in sub-section units (check_pfn_span()
+ * rejects anything finer on SPARSEMEM_VMEMMAP), so probing one PFN per
+ * PHXFS_REMAP_ALIGN finds every pgmap in the range.
+ */
+bool phxfs_find_pgmap(u64 start, u64 len, u64 skip_start, u64 skip_len,
+		      struct phxfs_pgmap_hit *hit)
+{
+	u64 addr, end = start + len;
+	unsigned long n = 0;
+
+	for (addr = ALIGN_DOWN(start, PHXFS_REMAP_ALIGN); addr < end;
+	     addr += PHXFS_REMAP_ALIGN) {
+		struct dev_pagemap *pg;
+
+		if (skip_len && addr >= skip_start && addr < skip_start + skip_len)
+			continue;
+		if ((++n & 4095) == 0)
+			cond_resched();
+		pg = get_dev_pagemap(PHYS_PFN(addr), NULL);
+		if (!pg)
+			continue;
+		if (hit) {
+			hit->addr = addr;
+			hit->type = pg->type;
+			pgmap_range_of(pg, &hit->start, &hit->end);
+		}
+		put_dev_pagemap(pg);
+		return true;
+	}
+	return false;
+}
+
+void phxfs_report_pgmap(struct phxfs_dev *dev, const char *what,
+			const struct phxfs_pgmap_hit *hit)
+{
+	phxfs_err("phxfs%d: refusing to %s: BAR offset 0x%llx already has struct "
+		  "pages (pgmap [0x%llx-0x%llx], type %d%s) owned by another "
+		  "mapping -- most likely the GPU driver's own BAR remap. "
+		  "Remapping over it would corrupt that driver's memory map; "
+		  "disable that driver's BAR remap to use phoenixfs on this GPU\n",
+		  dev->idx, what, hit->addr - dev->paddr, hit->start, hit->end,
+		  hit->type,
+		  hit->type == MEMORY_DEVICE_PCI_P2PDMA ? " PCI_P2PDMA" : "");
+}
 
 #ifdef CONFIG_PCI_P2PDMA
 
@@ -36,38 +94,41 @@
  * can exclude that range instead of attempting a conflicting remap. */
 static int phxfs_p2pdma_recover_slice(struct phxfs_dev *phx_dev)
 {
+	struct phxfs_pgmap_hit foreign = { 0 };
+	bool have_foreign = false;
 	u64 off, found = 0;
 	int matches = 0;
 
 	for (off = 0; off + PHXFS_REMAP_ALIGN <= phx_dev->size;
 	     off += PHXFS_REMAP_ALIGN) {
 		struct dev_pagemap *pg;
+		u64 range_start, range_end;
 
+		if (((off / PHXFS_REMAP_ALIGN) & 4095) == 4095)
+			cond_resched();
 		pg = get_dev_pagemap(PHYS_PFN(phx_dev->paddr + off), NULL);
 		if (!pg)
 			continue;
-		if (pg->type == MEMORY_DEVICE_PCI_P2PDMA) {
-			u64 range_start, range_end;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
-			range_start = pg->range.start;
-			range_end = pg->range.end;
-#else
-			range_start = pg->res.start;
-			range_end = pg->res.end;
-#endif
-			if (range_start != phx_dev->paddr + off ||
-			    range_end != phx_dev->paddr + off +
-				PHXFS_REMAP_ALIGN - 1) {
-				put_dev_pagemap(pg);
-				continue;
-			}
+		pgmap_range_of(pg, &range_start, &range_end);
+		/* Our slice: a P2PDMA pgmap covering exactly this sub-section. */
+		if (pg->type == MEMORY_DEVICE_PCI_P2PDMA &&
+		    range_start == phx_dev->paddr + off &&
+		    range_end == phx_dev->paddr + off + PHXFS_REMAP_ALIGN - 1) {
 			found = phx_dev->paddr + off;
 			matches++;
-			put_dev_pagemap(pg);
-			continue;
+		} else if (!have_foreign) {
+			have_foreign = true;
+			foreign.addr = phx_dev->paddr + off;
+			foreign.start = range_start;
+			foreign.end = range_end;
+			foreign.type = pg->type;
 		}
 		put_dev_pagemap(pg);
+	}
+
+	if (have_foreign) {
+		phxfs_report_pgmap(phx_dev, "use this GPU", &foreign);
+		return -EBUSY;
 	}
 
 	if (matches == 1) {
@@ -94,6 +155,7 @@ static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
 {
 	struct phxfs_pat_conflict *conflicts = NULL;
 	struct pci_dev *pdev = phx_dev->dev;
+	struct phxfs_pgmap_hit hit;
 	u64 span_start, span_len, slice = 0;
 	int n_blocks, n_conflicts, i, ret;
 
@@ -102,6 +164,18 @@ static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
 
 	if (pdev->p2pdma) {
 		return phxfs_p2pdma_recover_slice(phx_dev);
+	}
+
+	/*
+	 * No provider yet, so any pgmap in the BAR belongs to someone else
+	 * (e.g. the GPU driver remapped its own BAR). Bail out before
+	 * pci_p2pdma_add_resource(): it attaches a p2pdma provider to the GPU
+	 * device first and does not take it back when the remap then fails,
+	 * and its error path itself WARNs on some kernels.
+	 */
+	if (phxfs_find_pgmap(phx_dev->paddr, phx_dev->size, 0, 0, &hit)) {
+		phxfs_report_pgmap(phx_dev, "use this GPU", &hit);
+		return -EBUSY;
 	}
 
 	/*
@@ -238,6 +312,13 @@ int phxfs_p2pdma_setup(struct phxfs_dev *phx_dev)
 
 	return phxfs_p2pdma_verify_layout(phx_dev);
 #else
+	struct phxfs_pgmap_hit hit;
+
+	/* No bootstrap slice here: every pgmap in the BAR is foreign. */
+	if (phxfs_find_pgmap(phx_dev->paddr, phx_dev->size, 0, 0, &hit)) {
+		phxfs_report_pgmap(phx_dev, "use this GPU", &hit);
+		return -EBUSY;
+	}
 	return 0;
 #endif
 }

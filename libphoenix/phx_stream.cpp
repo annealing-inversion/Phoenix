@@ -119,10 +119,14 @@ static int phxfs_stream_io(int fd, void *buf, size_t *nbytes,
         }
 
         if (device_id >= 0) {
-            const bool staging =
-                mbuffer[device_id].map_mode == PHX_MAP_MODE_STAGING;
+            /* Only FULL registrations carry a P2P host address. STAGING
+             * registrations are no-ops and HOST registrations record the
+             * device pointer itself, which pread/pwrite cannot target. */
+            const bool no_p2p_addr =
+                mbuffer[device_id].map_mode == PHX_MAP_MODE_STAGING ||
+                mbuffer[device_id].map_mode == PHX_MAP_MODE_HOST;
             map_release(&mbuffer[device_id], node);
-            if (staging) {
+            if (no_p2p_addr) {
                 free(j);
                 *bytes_done = -EOPNOTSUPP;
                 return -EOPNOTSUPP;

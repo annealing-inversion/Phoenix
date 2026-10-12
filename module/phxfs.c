@@ -206,8 +206,10 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 			return -ENOSPC;
 		}
 
-		/* Detect PAT conflicts within [paddr, paddr + size) */
-		conflicts = kcalloc(max_blocks, sizeof(struct phxfs_pat_conflict), GFP_KERNEL);
+		/* Detect PAT conflicts within [paddr, paddr + size). One extra
+		 * slot is reserved below for the p2pdma bootstrap slice, so a
+		 * full PAT table can never crowd it out. */
+		conflicts = kcalloc(max_blocks + 1, sizeof(struct phxfs_pat_conflict), GFP_KERNEL);
 		if (!conflicts)
 			return -ENOMEM;
 
@@ -220,8 +222,7 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 		 * the remappable region, so the segment builder must always
 		 * route around it.
 		 */
-		if (n_conflicts >= 0 && phx_dev->p2p_slice_size &&
-		    n_conflicts < max_blocks) {
+		if (n_conflicts >= 0 && phx_dev->p2p_slice_size) {
 			conflicts[n_conflicts].start = phx_dev->p2p_slice_start;
 			conflicts[n_conflicts].end = phx_dev->p2p_slice_start +
 						     phx_dev->p2p_slice_size;
@@ -275,7 +276,17 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 	for (i = 0; i < n_segments; i++) {
 		struct dev_pagemap *pgmap;
 		struct phxfs_pgmap *p2p_pgmap;
+		struct phxfs_pgmap_hit hit;
 		void *va;
+
+		/* phxfs_p2pdma_setup() vetted the BAR at load; recheck right
+		 * before remapping, the kernel only checks the end points. */
+		if (phxfs_find_pgmap(segs[i].phys_start, segs[i].size,
+				     phx_dev->p2p_slice_start,
+				     phx_dev->p2p_slice_size, &hit)) {
+			phxfs_report_pgmap(phx_dev, "remap a FULL segment", &hit);
+			continue;
+		}
 
 		p2p_pgmap = devm_kzalloc(&phx_dev->dev->dev,
 					  sizeof(struct phxfs_pgmap), GFP_KERNEL);
@@ -365,6 +376,12 @@ fallback_single:
 	/* Legacy single-segment full BAR remap */
 	{
 		struct dev_pagemap *pgmap;
+		struct phxfs_pgmap_hit hit;
+
+		if (phxfs_find_pgmap(phx_dev->paddr, phx_dev->size, 0, 0, &hit)) {
+			phxfs_report_pgmap(phx_dev, "remap the whole BAR", &hit);
+			return -EBUSY;
+		}
 
 		/* The bootstrap pgmap is devm-owned by the PCI device and survives a
 		 * phoenixfs reload. A whole-BAR fallback would overlap it and trigger
@@ -518,6 +535,7 @@ static int phxfs_remap_span_locked(struct phxfs_dev *phx_dev, u64 phys_start,
 {
 	struct dev_pagemap *pgmap;
 	struct phxfs_pgmap *p2p_pgmap;
+	struct phxfs_pgmap_hit hit;
 	void *va;
 	u64 size;
 	int ins = 0, ret;
@@ -536,6 +554,16 @@ static int phxfs_remap_span_locked(struct phxfs_dev *phx_dev, u64 phys_start,
 		phxfs_err("phxfs%d: span [0x%llx-0x%llx) overlaps an existing "
 		       "segment\n", phx_dev->idx, phys_start, phys_end);
 		return -EEXIST;
+	}
+	/*
+	 * The end-point checks above (and memremap_pages()'s own) miss a pgmap
+	 * nested inside the span: another driver's BAR remap made since load,
+	 * the p2pdma bootstrap slice, or an idle-but-still-mapped segment of
+	 * ours whose GPU memory was freed and reallocated into this pool.
+	 */
+	if (phxfs_find_pgmap(phys_start, size, 0, 0, &hit)) {
+		phxfs_report_pgmap(phx_dev, "remap a staging span", &hit);
+		return -EBUSY;
 	}
 
 	ret = seg_reserve_one_locked(phx_dev);
@@ -965,7 +993,7 @@ static int phxfs_open(struct inode *inode, struct file *filp) {
 		dev_idx = extract_trailing_number(file_name);
 		phxfs_info("phxfs_open %s, npu_idx is %d\n", file_name, dev_idx);
 		if (dev_idx < 0 || dev_idx >= ctrl.dev_num) {
-			ret = -1;
+			ret = -ENODEV;
 			goto out;
 		}
 		filp->private_data = &ctrl.phx_dev[dev_idx];
@@ -985,14 +1013,14 @@ static long phxfs_ioctl(struct file *filp, unsigned int cmd,
 			struct phxfs_ioctl_map_s map_param;
 			if (copy_from_user(&map_param, argp, sizeof(struct phxfs_ioctl_map_s)))
 				return -EFAULT;
-			return phxfs_map_dev_addr(&map_param, map_param.n_vaddr, map_param.n_size,
+			return phxfs_map_dev_addr(filp, &map_param, map_param.n_vaddr, map_param.n_size,
 									map_param.c_vaddr, map_param.c_size);
 		}
 		case PHXFS_IOCTL_UNMAP: {
 			struct phxfs_ioctl_map_s map_param;
 			if (copy_from_user(&map_param, argp, sizeof(struct phxfs_ioctl_map_s)))
 				return -EFAULT;
-			phxfs_map_dev_release(&map_param, map_param.n_vaddr, map_param.n_size,
+			phxfs_map_dev_release(filp, &map_param, map_param.n_vaddr, map_param.n_size,
 								map_param.c_vaddr, map_param.c_size);
 			return 0;
 		}

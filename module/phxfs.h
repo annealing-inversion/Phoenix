@@ -8,6 +8,7 @@
 #include <linux/memremap.h>
 #include <linux/genalloc.h>
 #include <linux/cdev.h>
+#include <linux/completion.h>
 #include <linux/mmzone.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
@@ -227,6 +228,31 @@ static inline int phxfs_pgmap_set_provider(struct phxfs_pgmap *pg,
  */
 int phxfs_p2pdma_setup(struct phxfs_dev *phx_dev);
 
+/*
+ * An existing ZONE_DEVICE pgmap found inside a BAR range we were about to
+ * remap: `addr` is the probed sub-section, start/end/type describe the pgmap.
+ */
+struct phxfs_pgmap_hit {
+	u64 addr;
+	u64 start;
+	u64 end;	/* inclusive */
+	int type;	/* enum memory_type */
+};
+
+/*
+ * Look for any ZONE_DEVICE pgmap in [start, start + len), ignoring
+ * [skip_start, skip_start + skip_len). Must run before every remap of BAR
+ * memory: memremap_pages() only checks the two end points of the new range,
+ * so a pgmap nested strictly inside it (another driver's own BAR remap, or a
+ * stale phoenixfs segment) goes unnoticed until arch_add_memory() fails half
+ * way -- and that error path wipes the other pgmap's pgmap_array entries and
+ * leaves the already-added sub-sections behind. Returns true on a hit.
+ */
+bool phxfs_find_pgmap(u64 start, u64 len, u64 skip_start, u64 skip_len,
+		      struct phxfs_pgmap_hit *hit);
+void phxfs_report_pgmap(struct phxfs_dev *dev, const char *what,
+			const struct phxfs_pgmap_hit *hit);
+
 struct phxfs_ctrl {
     struct phxfs_dev phx_dev[MAX_DEV_NUM];
     int dev_num;
@@ -242,6 +268,9 @@ struct gpu_region {
 struct p2p_vmap {
     refcount_t   refs;            /* VMA owner + registered reclaim callback */
     atomic_t     callback_state;  /* live/running/dropped; see phxfs-mem.c */
+    struct completion reg_done;   /* registration finished reading the vendor
+                                   * page table; the reclaim callback waits
+                                   * for it (see force_release_gpu_memory) */
     u64          gpuvaddr;
     u64          size;
     unsigned long page_size;
@@ -269,7 +298,7 @@ typedef struct phxfs_ioctl_map_s phxfs_ioctl_map_t;
 #define PHXFS_IOCTL_MAP _IOW(PHXFS_IOCTL, 1, struct phxfs_ioctl_map_s)
 #define PHXFS_IOCTL_UNMAP _IOW(PHXFS_IOCTL, 2, struct phxfs_ioctl_map_s)
 
-void phxfs_map_dev_release(phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length);
+void phxfs_map_dev_release(struct file *filp, phxfs_ioctl_map_t *map_param, u64 devaddr, u64 dev_len, u64 cpuvaddr, u64 length);
 
 /*
  * Staging mode: give the registered buffer's BAR pages a ZONE_DEVICE mapping.

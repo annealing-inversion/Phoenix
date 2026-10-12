@@ -73,6 +73,9 @@ typedef struct phxfs_mmap_buffer_s {
     int bdev_fd;
     bool init_stat;     /* device is OPEN (fd valid, usable) */
     bool closing;       /* close in progress: reject new dev_get() */
+    bool opening;       /* fresh open still running its post-open setup
+                         * (probe / fallback / staging); other open()/close()
+                         * calls on this device wait (g_open_lock + cv) */
     int  open_count;    /* client open refcount */
     int  active_ops;    /* in-flight device operations */
     struct phxfs_mmap_node_s *head;

@@ -371,24 +371,48 @@ static int job_wait(struct pool_state *p, struct pool_job *job) {
     return err < 0 ? err : failed;
 }
 
+/*
+ * Run a job on the calling thread (no pool, or pool shutting down). Goes
+ * through worker_run_chunk() like a worker does, so per-op prepare/complete
+ * hooks still run, and keeps chunks within PHXFS_HOST_STAGE_SLOTS when hooks
+ * are present (each prepared op needs its own worker slot).
+ */
+static int run_inline(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op) {
+    struct pool_job job{};
+    struct phxfs_io_worker_ctx worker{};
+    int failed = 0, err = 0;
+    job.reqs = reqs;
+    job.n = n;
+    job.op = op;
+    worker.index = -1;
+
+    int step = n;
+    for (int i = 0; i < n; i++) {
+        if (reqs[i].prepare || reqs[i].complete) {
+            step = PHXFS_HOST_STAGE_SLOTS;
+            break;
+        }
+    }
+    for (int base = 0; base < n; base += step) {
+        int cnt = n - base < step ? n - base : step;
+        int lfailed = 0, lerr = 0;
+        worker_run_chunk(&job, base, cnt, &worker, &lfailed, &lerr);
+        failed += lfailed;
+        if (err == 0 && lerr < 0)
+            err = lerr;
+    }
+    if (worker.cleanup && worker.opaque)
+        worker.cleanup(worker.opaque);
+    return err < 0 ? err : failed;
+}
+
 int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op) {
     if (n <= 0)
         return 0;
 
     struct pool_state *p = pool_get();
-    if (!p) {
-        struct pool_job job{};
-        struct phxfs_io_worker_ctx worker{};
-        int failed = 0, err = 0;
-        job.reqs = reqs;
-        job.n = n;
-        job.op = op;
-        worker.index = -1;
-        worker_run_chunk(&job, 0, n, &worker, &failed, &err);
-        if (worker.cleanup && worker.opaque)
-            worker.cleanup(worker.opaque);
-        return err < 0 ? err : failed;
-    }
+    if (!p)
+        return run_inline(reqs, n, op);
 
     /* Synchronous: stack job (valid until we wait it), blocking enqueue. */
     struct pool_job job;
@@ -396,10 +420,8 @@ int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op) {
     job.reqs = reqs;
     job.n = n;
     job.op = op;
-    if (job_enqueue(p, &job, /*blocking=*/true) != 0) {
-        const struct phxfs_io_engine *eng = phxfs_io_engine_get();  /* shutting down */
-        return eng->submit_batch(reqs, n, op);
-    }
+    if (job_enqueue(p, &job, /*blocking=*/true) != 0)
+        return run_inline(reqs, n, op);   /* shutting down */
     return job_wait(p, &job);
 }
 

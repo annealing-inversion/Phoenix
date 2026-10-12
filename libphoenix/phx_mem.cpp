@@ -176,10 +176,12 @@ int phx_direct_probe(int device_id) {
     if (rc == 0) {
         void *target = NULL;
         rc = phx_regmem_internal(pb, dptr, probe_size, &target);
-        if (rc == 0)
-            rc = __phxfs_deregmem(pb, (u64)dptr, (u64)target, probe_size);
-        if (target && target != dptr)
-            munmap(target, probe_size);
+        /* phx_regmem_internal() linked a node (or took a reference on an
+         * identical live one): undo exactly that through the normal dereg
+         * path, so neither a stale node pointing at an unmapped VMA is left
+         * on the list nor another registration's mapping is torn down. */
+        if (rc == 0 && phxfs_deregmem(device_id, dptr, probe_size) != 0)
+            rc = -EIO;
         phx_connector_probe_free(dptr);
     }
     dev_put(pb);
