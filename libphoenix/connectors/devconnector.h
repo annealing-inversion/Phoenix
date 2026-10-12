@@ -111,6 +111,21 @@ struct devconn_ops {
                               void (*fn)(void *), void *arg);
 
     /*
+     * Staging-mode stream support (optional; NULL => the stream API keeps
+     * rejecting staging buffers). Called only from the submitting thread,
+     * never from inside a host callback.
+     *
+     * pointer_device: accelerator ordinal owning device/managed memory at
+     *        ptr, or a negative errno (-ENOENT for host memory).
+     * memcpy_dtod_on_stream: enqueue an async D2D copy on the user stream,
+     *        which belongs to accelerator `device_id`. The caller's current
+     *        device is left unchanged.
+     */
+    int   (*pointer_device)(const void *ptr);
+    int   (*memcpy_dtod_on_stream)(int device_id, void *dst, const void *src,
+                                   size_t n, void *stream);
+
+    /*
      * Profiler range annotations (NVTX on NVIDIA, vendor equivalents
      * elsewhere). Both may be NULL — the core checks before calling, so a
      * vendor without a profiler API needs no stubs and pays nothing.

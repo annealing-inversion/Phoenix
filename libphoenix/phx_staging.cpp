@@ -544,6 +544,163 @@ static void run_device(int d, phxfs_io_req_t *reqs, int n, int is_write) {
 }  // namespace
 
 /* ------------------------------------------------------------------ */
+/* Pool ownership (shared by the sync batch and the stream path)      */
+/* ------------------------------------------------------------------ */
+
+void phx_staging_claim(phxfs_mmap_buffer_t *pb, void *stream) {
+    pthread_mutex_lock(&pb->staging_lock);
+    while (pb->staging_users > 0 &&
+           !(stream && pb->staging_owner == stream))
+        pthread_cond_wait(&pb->staging_cv, &pb->staging_lock);
+    pb->staging_owner = stream;
+    pb->staging_users++;
+    pthread_mutex_unlock(&pb->staging_lock);
+}
+
+void phx_staging_unclaim(phxfs_mmap_buffer_t *pb) {
+    pthread_mutex_lock(&pb->staging_lock);
+    if (--pb->staging_users == 0) {
+        pb->staging_owner = NULL;
+        pthread_cond_broadcast(&pb->staging_cv);
+    }
+    pthread_mutex_unlock(&pb->staging_lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stream-ordered path                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Everything is enqueued on the user stream by the submitting thread, so
+ * stream order alone sequences it; the host callbacks only do pread/pwrite
+ * and pthread bookkeeping (no CUDA, see phx_stream.cpp). Per pool-sized tile:
+ *
+ *   READ : D2D user->staging (backup) | cb: pread into staging | D2D staging->user
+ *   WRITE: D2D user->staging          | cb: pwrite from staging
+ *
+ * plus one final callback that publishes *bytes_done and releases the pool.
+ * The read backup makes short reads / skipped tiles copy the original bytes
+ * back, so the unread suffix is preserved without a length-dependent copy.
+ * Jobs on the same stream share the pool (stream order serializes them);
+ * a different stream or a sync batch waits in phx_staging_claim().
+ */
+namespace {
+
+struct StreamJob {
+    phxfs_mmap_buffer_t *pb;
+    int      fd;
+    bool     is_write;
+    bool     stop;        /* set after error/short transfer: skip the rest */
+    off_t    f_offset;
+    void    *host;        /* staging pool, CPU view */
+    ssize_t  done;
+    ssize_t *bytes_done;
+    int      ntiles;
+    int      next;        /* next tile index the I/O callback handles */
+    size_t   tile_sz;
+    size_t   nbytes;
+};
+
+static void stream_io_cb(void *arg) {
+    StreamJob *j = (StreamJob *)arg;
+    size_t off = (size_t)j->next++ * j->tile_sz;
+    if (j->stop)
+        return;
+    size_t len = j->nbytes - off < j->tile_sz ? j->nbytes - off : j->tile_sz;
+    ssize_t r = xfer(j->fd, j->host, (ssize_t)len, j->f_offset + (off_t)off,
+                     j->is_write);
+    if (r < 0) {
+        if (j->done == 0)
+            j->done = r;
+        j->stop = true;
+        return;
+    }
+    j->done += r;
+    if ((size_t)r != len)
+        j->stop = true;
+}
+
+static void stream_finish_cb(void *arg) {
+    StreamJob *j = (StreamJob *)arg;
+    *j->bytes_done = j->done;
+    phx_staging_unclaim(j->pb);
+    dev_put(j->pb);
+    free(j);
+}
+
+}  // namespace
+
+int phx_staging_stream(phxfs_mmap_buffer_t *pb, int fd, void *user,
+                       size_t nbytes, off_t f_offset, ssize_t *bytes_done,
+                       void *stream, bool is_write) {
+    if (!devconn->memcpy_dtod_on_stream || !pb->staging_dptr ||
+        pb->staging_size == 0) {
+        dev_put(pb);
+        *bytes_done = -EOPNOTSUPP;
+        return -EOPNOTSUPP;
+    }
+    StreamJob *j = (StreamJob *)calloc(1, sizeof(*j));
+    if (!j) {
+        dev_put(pb);
+        *bytes_done = -ENOMEM;
+        return -ENOMEM;
+    }
+    j->pb = pb;
+    j->fd = fd;
+    j->is_write = is_write;
+    j->f_offset = f_offset;
+    j->host = pb->staging_host;
+    j->bytes_done = bytes_done;
+    j->nbytes = nbytes;
+    j->tile_sz = pb->staging_size < PHXFS_IO_CHUNK ? pb->staging_size
+                                                    : PHXFS_IO_CHUNK;
+    j->ntiles = (int)((nbytes + j->tile_sz - 1) / j->tile_sz);
+
+    const int dev = pb->device_id;
+    char *staging = (char *)pb->staging_dptr;
+    int rc = 0;
+    bool queued = false;
+
+    pthread_mutex_lock(&pb->staging_submit_lock);
+    phx_staging_claim(pb, stream);
+    for (int t = 0; t < j->ntiles && rc == 0; t++) {
+        size_t off = (size_t)t * j->tile_sz;
+        size_t len = nbytes - off < j->tile_sz ? nbytes - off : j->tile_sz;
+        char *u = (char *)user + off;
+        rc = devconn->memcpy_dtod_on_stream(dev, staging, u, len, stream);
+        if (rc == 0) {
+            queued = true;
+            rc = devconn->launch_host_func(stream, stream_io_cb, j);
+        }
+        if (rc == 0 && !is_write)
+            rc = devconn->memcpy_dtod_on_stream(dev, u, staging, len, stream);
+    }
+    if (!queued) {
+        phx_staging_unclaim(pb);
+        pthread_mutex_unlock(&pb->staging_submit_lock);
+        dev_put(pb);
+        free(j);
+        *bytes_done = rc;
+        return rc;
+    }
+    if (rc != 0) {
+        /* Part of the job is already queued: let it drain, but report the
+         * failure and skip any further I/O. */
+        j->done = rc;
+        j->stop = true;
+    }
+    int frc = devconn->launch_host_func(stream, stream_finish_cb, j);
+    pthread_mutex_unlock(&pb->staging_submit_lock);
+    if (frc != 0) {
+        /* Broken stream: queued ops may still reference j and the pool, so
+         * neither is released (j is leaked, the pool stays claimed). */
+        *bytes_done = frc;
+        return frc;
+    }
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
 /* Public (internal) entry point                                      */
 /* ------------------------------------------------------------------ */
 
@@ -580,8 +737,11 @@ int phx_staging_batch(phxfs_io_req_t *reqs, int n, int is_write) {
 
     /* GPU requests run per device (each device has its own staging pool). */
     for (int d = 0; d < g_device_count; d++) {
-        if (held[d])
+        if (held[d]) {
+            phx_staging_claim(&mbuffer[d], NULL);
             run_device(d, reqs, n, is_write);
+            phx_staging_unclaim(&mbuffer[d]);
+        }
     }
 
     for (int d = 0; d < g_device_count; d++) {

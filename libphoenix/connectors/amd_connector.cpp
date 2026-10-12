@@ -303,6 +303,39 @@ static int amd_launch_host_func(void *stream,
     return 0;
 }
 
+/* Owning ordinal of device/managed memory; -ENOENT for host memory. */
+static int amd_pointer_device(const void *ptr)
+{
+    hipPointerAttribute_t attrs;
+    if (hipPointerGetAttributes(&attrs, ptr) != hipSuccess) {
+        (void)hipGetLastError();   /* host ptrs may be reported as errors */
+        return -ENOENT;
+    }
+    if (attrs.type == hipMemoryTypeDevice || attrs.isManaged)
+        return attrs.device;
+    return -ENOENT;
+}
+
+static int amd_memcpy_dtod_on_stream(int device_id, void *dst,
+                                     const void *src, size_t n, void *stream)
+{
+    int prev = -1;
+    if (hipGetDevice(&prev) != hipSuccess)
+        return -EIO;
+    if (prev != device_id && hipSetDevice(device_id) != hipSuccess)
+        return -EIO;
+    hipError_t rc = hipMemcpyAsync(dst, src, n, hipMemcpyDeviceToDevice,
+                                   (hipStream_t)stream);
+    if (prev != device_id)
+        (void)hipSetDevice(prev);
+    if (rc != hipSuccess) {
+        fprintf(stderr, "amd_memcpy_dtod_on_stream: %s\n",
+                hipGetErrorString(rc));
+        return -EIO;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Connector registration                                             */
 /* ------------------------------------------------------------------ */
@@ -349,6 +382,8 @@ static struct devconn_ops amd_devconn = {
     .memcpy_dtod_async = amd_memcpy_dtod_async,
     .queue_sync   = amd_queue_sync,
     .launch_host_func = amd_launch_host_func,
+    .pointer_device = amd_pointer_device,
+    .memcpy_dtod_on_stream = amd_memcpy_dtod_on_stream,
     .range_push   = NULL,
     .range_pop    = NULL,
 };

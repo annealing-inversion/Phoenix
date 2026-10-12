@@ -20,7 +20,9 @@
  * waits on deadlocks the moment that thread enters CUDA. The callback is
  * therefore only xfer() (pread/pwrite) + free().
  *
- * Staging-mode devices and connectors without launch_host_func are
+ * Staging-mode buffers go to phx_staging_stream(), which keeps the same
+ * rule: its D2D copies are enqueued by the submitting thread, only
+ * pread/pwrite run in callbacks. Connectors without launch_host_func are
  * rejected with -EOPNOTSUPP — there is no synchronous fallback.
  */
 
@@ -125,6 +127,23 @@ static int phxfs_stream_io(int fd, void *buf, size_t *nbytes,
                 *bytes_done = -EOPNOTSUPP;
                 return -EOPNOTSUPP;
             }
+        } else if (devconn->pointer_device &&
+                   (device_id = devconn->pointer_device(buf)) >= 0) {
+            /* Unregistered accelerator memory: staging regmem pins nothing,
+             * so such a buffer is only usable through a staging device. */
+            free(j);
+            void *user = NULL;
+            phxfs_mmap_buffer_t *pb = dev_get(device_id);
+            if (!pb || pb->map_mode != PHX_MAP_MODE_STAGING ||
+                resolve_cpu_buf(buf, bo, nb, &user) != 0 ||
+                devconn->pointer_device((const char *)user + nb - 1) !=
+                    device_id) {
+                dev_put(pb);
+                *bytes_done = -EFAULT;
+                return -EFAULT;
+            }
+            return phx_staging_stream(pb, fd, user, nb, fo, bytes_done,
+                                      stream, op == PHXFS_OP_WRITE);
         } else if (resolve_cpu_buf(buf, bo, nb, &j->host) != 0) {
             free(j);
             *bytes_done = -EFAULT;

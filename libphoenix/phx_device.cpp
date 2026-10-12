@@ -94,6 +94,11 @@ static void phxfs_dev_ctor(void) {
         mbuffer[i].staging_dptr = NULL;
         mbuffer[i].staging_host = NULL;
         mbuffer[i].staging_size = 0;
+        pthread_mutex_init(&mbuffer[i].staging_lock, NULL);
+        pthread_cond_init(&mbuffer[i].staging_cv, NULL);
+        pthread_mutex_init(&mbuffer[i].staging_submit_lock, NULL);
+        mbuffer[i].staging_owner = NULL;
+        mbuffer[i].staging_users = 0;
         for (int s = 0; s < PHX_HOST_STAGING_SLOTS; s++) {
             mbuffer[i].host_staging[s] = NULL;
             mbuffer[i].host_staging_busy[s] = false;

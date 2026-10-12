@@ -11,9 +11,9 @@
  * succeeds on the GPU whose BAR covers the buffer, and libphoenix rolls
  * failed attempts back cleanly (munmap + node free), so probing is
  * side-effect-free. Registration is a low-frequency control operation,
- * so the probe loop's cost is irrelevant. Staging-mode devices are
- * skipped: their stream path is unsupported by libphoenix (-EOPNOTSUPP)
- * and opening them would allocate their staging pools for nothing.
+ * so the probe loop's cost is irrelevant. On staging-mode devices regmem
+ * pins nothing (it accepts any buffer); the stream path then resolves the
+ * owning GPU from the pointer itself, so the recorded device is unused.
  *
  * Additional shim-side state: the registration bookkeeping (base addr ->
  * aligned length + device, needed to play back the aligned length on
@@ -34,9 +34,6 @@
 #include <unistd.h>
 
 #include <phoenix.h> /* libphoenix public C API (/usr/local/include) */
-
-/* phxfs BAR mapping modes (phoenix.h: 0 = FULL, 1 = STAGING). */
-#define PHXFILE_MAP_MODE_STAGING 1
 
 /* Probe scan ceiling — NOT the device count. The real set of phxfs
  * devices is discovered via /dev/phxfs_devN existence at runtime, so a
@@ -130,16 +127,12 @@ static void reg_remove(size_t i)
  * ------------------------------------------------------------------ */
 
 /*
- * One-time discovery: open every FULL-mode phxfs device.
+ * One-time discovery: open every phxfs device.
  *   - /dev/phxfs_devN absent      -> device does not exist, skip
- *   - staging mode (sysfs lookup) -> skip: the stream path is unsupported
- *     there (-EOPNOTSUPP upstream) and opening would allocate the
- *     device's staging pool for nothing
  *   - phxfs_open failure          -> skip (not retried this process)
- * Opening a FULL-mode device is lightweight (fd open + sysfs read).
  *
  * Returns 0, -ENODEV (no phxfs device present at all) or -EOPNOTSUPP
- * (devices present but all staging-mode). Caller holds g_lock.
+ * (devices present but none could be opened). Caller holds g_lock.
  */
 static int probe_devices_locked(void)
 {
@@ -153,8 +146,6 @@ static int probe_devices_locked(void)
         if (access(path, F_OK) != 0)
             continue;
         found_any = 1;
-        if (phxfs_get_map_mode(d) == PHXFILE_MAP_MODE_STAGING)
-            continue;
         if (phxfs_open(d) == 0) {
             g_opened[d] = 1;
             g_nopened++;

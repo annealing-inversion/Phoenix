@@ -158,10 +158,8 @@ int main(int argc, char **argv) {
     printf("phxfs dev=%d, page=%llu, map_mode=%s\n", dev,
            (unsigned long long)phxfs_get_page_size(),
            phxfs_get_map_mode(dev) == 0 ? "FULL" : "STAGING");
-    if (phxfs_get_map_mode(dev) != 0) {
-        SKIP("device is in STAGING mode; the stream API supports FULL only "
-             "(stream-ordered staging is planned; staging devices use the "
-             "synchronous phxfs_read/phxfs_write)");
+    if (phxfs_get_map_mode(dev) > 1) {
+        SKIP("device is in HOST fallback mode; unsupported by the stream API");
         printf("%d run, %d passed, %d failed, %d skipped\n",
                tests_run, tests_passed, tests_failed, tests_skipped + 1);
         phxfs_close(dev);

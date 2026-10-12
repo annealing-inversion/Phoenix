@@ -205,12 +205,15 @@ const char *phxfs_io_engine_name(void);
  * every submission carries the stream handle; there is no per-stream
  * state to set up or tear down.
  *
- * Staging-mode devices (map_mode=staging) are NOT supported by the stream
- * API: their two-hop path (SSD -> staging pool -> D2D -> user) would need
- * the D2D leg inside or around the callback, which CUDA forbids.
- * Submissions whose buffer device is staging fail with -EOPNOTSUPP;
- * staging devices keep using the synchronous phxfs_read / phxfs_write
- * (and the batch API). Stream-ordered staging support is planned.
+ * Staging-mode devices (map_mode=staging): the submitting thread enqueues
+ * D2D copies (user <-> staging pool) around the pure pread/pwrite host
+ * callbacks on the same user stream, so the ordering model above holds
+ * unchanged. Reads first back the destination up into the pool, so a
+ * short read leaves the unread suffix untouched. The pool is shared by
+ * submissions on one stream; a submission from a different stream (or a
+ * synchronous staging read/write) BLOCKS until the previous owner's queued
+ * work has drained. Requires the connector's pointer_device and
+ * memcpy_dtod_on_stream ops, otherwise -EOPNOTSUPP.
  *
  * Submission contract (mirrors cuFileReadAsync/WriteAsync):
  *   - nbytes / buf_offset / f_offset point at caller-owned storage whose
@@ -228,10 +231,11 @@ const char *phxfs_io_engine_name(void);
  *     cuFileReadAsync / cuFileWriteAsync users follow).
  *   - the buffer device is resolved from the buffer itself, like
  *     cuFileReadAsync: a buf inside any opened device's registration
- *     table is a GPU buffer (DMA against its P2P host address; a
- *     staging-mode device fails with -EOPNOTSUPP); a buf inside no
- *     registration is a plain CPU address. An extent sticking out of
- *     its registration fails with -EFAULT.
+ *     table is a GPU buffer (DMA against its P2P host address); an
+ *     unregistered accelerator pointer goes through its device's staging
+ *     pool (staging mode) or fails with -EFAULT; anything else is a plain
+ *     CPU address. An extent sticking out of its registration fails with
+ *     -EFAULT.
  *   - returns 0 if the submission was accepted (I/O outcome is reported
  *     through *bytes_done), or a negative errno for submission-level
  *     failures (bad args, callback enqueue failure...).

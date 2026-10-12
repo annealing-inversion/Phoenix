@@ -345,6 +345,41 @@ static int nvidia_launch_host_func(void *stream,
     return 0;
 }
 
+/* Owning ordinal of device/managed memory; -ENOENT for host memory. */
+static int nvidia_pointer_device(const void *ptr)
+{
+    cudaPointerAttributes attrs;
+    if (cudaPointerGetAttributes(&attrs, ptr) != cudaSuccess) {
+        cudaGetLastError();   /* older runtimes report host ptrs as errors */
+        return -ENOENT;
+    }
+    if (attrs.type == cudaMemoryTypeDevice ||
+        attrs.type == cudaMemoryTypeManaged)
+        return attrs.device;
+    return -ENOENT;
+}
+
+static int nvidia_memcpy_dtod_on_stream(int device_id, void *dst,
+                                        const void *src, size_t n,
+                                        void *stream)
+{
+    int prev = -1;
+    if (cudaGetDevice(&prev) != cudaSuccess)
+        return -EIO;
+    if (prev != device_id && cudaSetDevice(device_id) != cudaSuccess)
+        return -EIO;
+    cudaError_t rc = cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToDevice,
+                                     (cudaStream_t)stream);
+    if (prev != device_id)
+        cudaSetDevice(prev);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "nvidia_memcpy_dtod_on_stream: %s\n",
+                cudaGetErrorString(rc));
+        return -EIO;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Profiler ranges (NVTX)*/
 /* ------------------------------------------------------------------ */
@@ -394,6 +429,8 @@ static struct devconn_ops nvidia_devconn = {
     .memcpy_dtod_async = nvidia_memcpy_dtod_async,
     .queue_sync   = nvidia_queue_sync,
     .launch_host_func = nvidia_launch_host_func,
+    .pointer_device = nvidia_pointer_device,
+    .memcpy_dtod_on_stream = nvidia_memcpy_dtod_on_stream,
 #ifdef PHX_NVTX
     .range_push   = nvidia_range_push,
     .range_pop    = nvidia_range_pop,

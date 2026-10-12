@@ -86,6 +86,13 @@ typedef struct phxfs_mmap_buffer_s {
     void  *staging_dptr;    /* Phoenix-owned device staging pool (or NULL) */
     void  *staging_host;    /* host-mapped P2P vaddr of the staging pool */
     size_t staging_size;    /* staging pool byte size */
+    /* Pool ownership: one synchronous batch, or any number of stream jobs
+     * queued on the SAME stream (stream order serializes them). */
+    pthread_mutex_t staging_lock;
+    pthread_cond_t  staging_cv;
+    pthread_mutex_t staging_submit_lock;  /* keeps one job's ops contiguous */
+    void  *staging_owner;
+    int    staging_users;
 
     /* Host-staging fallback pool: preallocated pinned host slots. */
     void  *host_staging[PHX_HOST_STAGING_SLOTS];
@@ -144,6 +151,11 @@ int  phx_staging_setup(int device_id);
 /* Free the staging pool. Called during close teardown AFTER the staging
  * registration has been torn down; pb ref is not required. */
 void phx_staging_teardown(phxfs_mmap_buffer_t *pb);
+/* Block until the staging pool is free or already owned by `stream`, then
+ * take one use. stream == NULL claims it exclusively (synchronous path).
+ * Release may run inside a host callback (pure pthread, no CUDA). */
+void phx_staging_claim(phxfs_mmap_buffer_t *pb, void *stream);
+void phx_staging_unclaim(phxfs_mmap_buffer_t *pb);
 /* Host-staging fallback pool (same lifecycle as the GPU staging pool). */
 int  phx_host_staging_setup(int device_id);
 void phx_host_staging_teardown(phxfs_mmap_buffer_t *pb);
@@ -153,5 +165,12 @@ void  phx_host_staging_release(phxfs_mmap_buffer_t *pb, int slot);
  * is_write selects the direction. Returns failed-request count (>=0) or a
  * negative errno, matching phxfs_read_batch/phxfs_write_batch. */
 int  phx_staging_batch(phxfs_io_req_t *reqs, int n, int is_write);
+/* Stream-ordered staging I/O (phx_stream.cpp). Enqueues on `stream`:
+ * D2D copies around pure pread/pwrite host callbacks. Consumes the
+ * caller's dev_get() reference on pb in all cases. Returns 0 if accepted
+ * (outcome in *bytes_done after the stream passes it) or a negative errno. */
+int  phx_staging_stream(phxfs_mmap_buffer_t *pb, int fd, void *user,
+                        size_t nbytes, off_t f_offset, ssize_t *bytes_done,
+                        void *stream, bool is_write);
 
 #endif /* __PHX_INTERNAL_H__ */
