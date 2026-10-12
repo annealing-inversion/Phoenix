@@ -14,7 +14,7 @@ Phoenix is evolving from a research artifact (SC'25) into a long-term open-sourc
 ## Research
 
 - **Multi-vendor P2P backends**: the kernel `phxfs_p2p_ops` and user-library `DevConnector` interfaces are in place (`PHXFS_VENDOR=NVIDIA|AMD|HUAWEI`); implementing the AMD (`amd-backend.c`/`amd_connector.cpp`) and Huawei NPU (`huawei-backend.c`/`huawei_connector.cpp`) backends is the next step — direct storage→NPU transfer has been experimentally proven feasible.
-- **Multi-framework adapters**: lmcache KV-cache acceleration (integration guide in `adapters/lmcache/`); further AI-data-loader offloads.
+- **Multi-framework adapters**: further AI-data-loader offloads; LMCache already integrates through its official GDS `phx` backend and the shim in `adapters/lmcache/phxfile/`.
 - **Policy & scheduling**: adaptive chunking, multi-GPU striping, and QoS-aware DMA scheduling.
 - **Filesystem breadth**: broader backend coverage (more distributed/storage backends) with unchanged application APIs.
 

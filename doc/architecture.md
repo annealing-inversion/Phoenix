@@ -35,7 +35,7 @@ Phoenix refactors the I/O stack for **GPU Direct Storage (GDS)** so that data mo
 | --- | --- |
 | `module/` | `phxfs` Linux kernel module: GPU BAR remap, per-GPU char device, `mmap`/`ioctl` P2P mapping; `phxfs-backend.*` selects the vendor P2P backend at build time |
 | `libphoenix/` | User-space C/C++ library wrapping the char device; buffer registration and synchronous/async I/O; `connectors/` holds the vendor-specific `DevConnector` |
-| `adapters/` | Integration with AI frameworks via pybind11. `adapters/vLLM/` ships `phxloader` for safetensors weight loading |
+| `adapters/` | vLLM uses `phxloader` via pybind11; the official LMCache GDS backend uses the `phxfile` C shim via ctypes |
 | `test/` | Correctness + performance tests (`test_regmem`, `test_io`, `test_batch`) |
 
 ## Multi-vendor support

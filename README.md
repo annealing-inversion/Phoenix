@@ -4,7 +4,7 @@
 
 Phoenix is a rebuilt version of GPU Direct Storage (GDS) that lets data flow straight from storage into GPU/NPU memory — faster, and easier to deploy than existing GDS. AI applications plug in through simple adapters.
 
-> 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*. Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data (vLLM done; lmcache planned).
+> 📄 Built on the SC'25 paper *"Phoenix: A Refactored I/O Stack for GPU Direct Storage without Phony Buffers"*. Phoenix is now a long-term open-source middleware for storage→xPU I/O, with adapters for AI data (vLLM weight loading; official LMCache GDS backend).
 
 > 🚀 **To build and run Phoenix, see [doc/install.md](doc/install.md).**
 
@@ -27,7 +27,7 @@ By removing the phony buffer, Phoenix becomes a direct hub between storage and x
   <img src="doc/phoenix-architecture.png" alt="Phoenix architecture: AI applications plug into the Phoenix hub, connecting storage to xPU accelerators" width="900">
 </p>
 
-The kernel module (`phxfs`) maps accelerator memory via `ZONE_DEVICE` and serves P2P mappings; the user library (`libphoenix`) exposes simple registration/I/O APIs; adapters (via pybind11) plug Phoenix into AI frameworks.
+The kernel module (`phxfs`) maps accelerator memory via `ZONE_DEVICE` and serves P2P mappings; the user library (`libphoenix`) exposes simple registration/I/O APIs; adapters (via pybind11 or C shim/ctypes) plug Phoenix into AI frameworks.
 
 ## Why Phoenix (vs. NVIDIA cuFile / GDS)
 
@@ -50,7 +50,7 @@ On the direct path Phoenix delivers full storage→GPU DMA with no CPU bounce bu
 | Python bindings | ✅ Implemented | `python/phxfs` (ctypes) |
 | vLLM model loading | ✅ Implemented | `adapters/vllm/phxloader` (V2.2) |
 | Batch & async I/O (`io_uring`) | ✅ Implemented | sync `phxfs_*_batch` + async submit/wait; NUMA thread pool; `libaio` engine planned |
-| lmcache KV-cache acceleration | 🚧 Roadmap | see [roadmap](doc/roadmap.md) |
+| LMCache KV-cache acceleration | Available | official GDS `phx` backend via [phxfile](adapters/lmcache/phxfile/README.md); FULL mode required |
 | NPU (non-NVIDIA) support | 🔬 Research | experimentally proven, not yet in code |
 
  

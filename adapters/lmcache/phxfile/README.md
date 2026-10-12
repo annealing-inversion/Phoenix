@@ -1,15 +1,15 @@
 # libphxfile — frozen-ABI shim between LMCache and libphoenix
 
-`libphxfile.so` freezes the file-IO surface LMCache's GDS L1 `phx` backend
-(`lmcache/v1/gpu_connector/_phx_async.py`, a plain ctypes wrapper) programs
-against. libphoenix is free to evolve underneath (e.g. the planned removal of
-the `phxdev` parameter from `phxfs_regmem`/`phxfs_deregmem`); the change is
-absorbed inside this library. Consumers only reinstall the `.so` — zero code
-change, zero re-binding.
+`libphxfile.so` freezes the file-IO surface the official LMCache GDS `phx`
+backend (`lmcache/v1/gpu_connector/gds_backends/phx.py`, a ctypes wrapper)
+programs against. libphoenix is free to evolve underneath (e.g. the planned
+removal of the `phxdev` parameter from `phxfs_regmem`/`phxfs_deregmem`); the
+change is absorbed inside this library. Consumers only reinstall the `.so`
+— zero code change, zero re-binding.
 
-This mirrors what `phxcache` (pybind11) does for the L2 batch path, but as a
-pure C library: no Python, no pybind11, no torch dependency — buildable with
-any C11 compiler.
+This is the supported LMCache integration in this repository. It is a pure
+C library with no Python, pybind11 or torch build dependency — buildable
+with any C11 compiler.
 
 ## Frozen ABI
 
@@ -83,9 +83,9 @@ sudo make install PREFIX=/usr/local
 sudo ldconfig
 ```
 
-Requires libphoenix headers/library in `/usr/local` (same prerequisite as
-phxcache). After reinstalling libphoenix, rebuild this shim too — it is
-compile-time bound to libphoenix's C ABI.
+Requires libphoenix headers/library in `/usr/local`. After reinstalling
+libphoenix, rebuild this shim too — it is compile-time bound to libphoenix's
+C ABI.
 
 ## Freeze discipline
 

@@ -1,6 +1,6 @@
 # Adapters
 
-Adapters connect Phoenix to AI applications. Each adapter depends on `libphoenix` (via `pybind11` bindings) to perform direct storage→xPU transfers for a specific framework.
+Adapters connect Phoenix to AI applications through `libphoenix`: vLLM uses `pybind11` bindings, while the official LMCache GDS backend uses the `libphxfile.so` C shim via ctypes.
 
 ## vLLM — `phxloader` (available)
 
@@ -53,6 +53,8 @@ loader.close()
 
 `libphoenix`, `liburing`, CUDA, `pybind11`, PyTorch.
 
-## lmcache (integration guide available)
+## LMCache — official GDS `phx` backend
 
-KV-cache offload/loading acceleration via the Phoenix batch API. The integration guide for the `phxcache` pybind layer and the LMCache `phx_l2_adapter` lives at [`adapters/lmcache/PHOENIX_BATCH_INTEGRATION.md`](../adapters/lmcache/PHOENIX_BATCH_INTEGRATION.md): one `phxfs_read_batch` per retrieve task (sync or pipelined async for layerwise overlap), packed files so many chunks share one fd, and no Python worker threads — concurrency lives inside Phoenix below the GIL.
+The official LMCache backend in `lmcache/v1/gpu_connector/gds_backends/phx.py` calls `libphxfile.so` through ctypes. The shim forwards `phxFileReadAsync` / `phxFileWriteAsync` to `phxfs_read_stream` / `phxfs_write_stream`, preserving stream ordering without a Python extension.
+
+Build and ABI details: [`adapters/lmcache/phxfile/README.md`](../adapters/lmcache/phxfile/README.md). GPU I/O requires FULL mapping mode; STAGING and HOST fallback are not supported by the current stream path.

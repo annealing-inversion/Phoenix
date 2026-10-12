@@ -1,6 +1,6 @@
 # Build libphxfile.so — the frozen-ABI shim over libphoenix for LMCache.
 #
-# Prerequisites (system-wide, same as phxcache):
+# Prerequisites (system-wide):
 #   - libphoenix headers + library in /usr/local/include, /usr/local/lib
 #   - a C11 compiler (plain gcc is fine; no CUDA / Python needed)
 #
