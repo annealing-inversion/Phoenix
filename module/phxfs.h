@@ -62,6 +62,12 @@ extern int phxfs_debug;
 #define PHXFS_REMAP_ALIGN      ((u64)PAGES_PER_SUBSECTION << PAGE_SHIFT)
 
 /*
+ * Refreshed from debugfs by the install/insmod Make targets in user space.
+ * Same path as the kernel-side snapshot in phxfs-mem.c.
+ */
+#define PHXFS_PAT_PATH "/run/phxfs/pat_memtype_list"
+
+/*
  * A BAR range that some other mapping already holds a non-write-back memtype
  * for, as parsed out of the kernel's PAT memtype list. devm_memremap_pages()
  * refuses to remap such a range, so the segment builder has to route around it.

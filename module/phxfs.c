@@ -378,7 +378,9 @@ fallback_single:
 		struct dev_pagemap *pgmap;
 		struct phxfs_pgmap_hit hit;
 
-		if (phxfs_find_pgmap(phx_dev->paddr, phx_dev->size, 0, 0, &hit)) {
+		if (phxfs_find_pgmap(phx_dev->paddr, phx_dev->size,
+				     phx_dev->p2p_slice_start,
+				     phx_dev->p2p_slice_size, &hit)) {
 			phxfs_report_pgmap(phx_dev, "remap the whole BAR", &hit);
 			return -EBUSY;
 		}
@@ -428,10 +430,12 @@ fallback_single:
 	phxfs_info("npu numa is %d\n", phx_dev->dev->dev.numa_node);
 
 		if (IS_ERR_OR_NULL(phx_dev->pci_mem_va)) {
-			phxfs_err("phxfs%d: fallback devm_memremap_pages failed\n",
-			       phx_dev->idx);
+			ret = IS_ERR(phx_dev->pci_mem_va) ?
+				      PTR_ERR(phx_dev->pci_mem_va) : -ENOMEM;
+			phxfs_err("phxfs%d: fallback devm_memremap_pages failed (%d)\n",
+			       phx_dev->idx, ret);
 			devm_kfree(&phx_dev->dev->dev, phx_dev->p2p_pgmap);
-			return -ENOMEM;
+			return ret;
 		}
 
 	phxfs_info("npu devm_memremap_pages success, addr is %lx\n",

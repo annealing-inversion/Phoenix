@@ -218,8 +218,11 @@ static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
 
 	if (!slice) {
 		phxfs_err("phxfs%d: no PAT-conflict-free %llu MiB block for the "
-		       "p2pdma bootstrap slice\n", phx_dev->idx,
-		       PHXFS_REMAP_ALIGN >> 20);
+		       "p2pdma bootstrap slice; check %s for mappings that "
+		       "cover the whole BAR (e.g. a whole-BAR write-combining "
+		       "remap by the GPU driver or a tool) -- phoenixfs needs "
+		       "the BAR free of foreign mappings\n",
+		       phx_dev->idx, PHXFS_REMAP_ALIGN >> 20, PHXFS_PAT_PATH);
 		ret = -ENOSPC;
 		goto out;
 	}

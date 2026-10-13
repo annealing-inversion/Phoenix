@@ -14,8 +14,6 @@
 #include "phxfs-backend.h"
 #include "config-host.h"
 
-/* Refreshed from debugfs by the install/insmod Make targets in user space. */
-#define PHXFS_PAT_PATH "/run/phxfs/pat_memtype_list"
 #define PHXFS_PAT_BUF_SIZE (64 * 1024) /* PAT file typically < 16 KiB */
 
 /*
