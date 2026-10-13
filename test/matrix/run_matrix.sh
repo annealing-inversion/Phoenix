@@ -208,6 +208,142 @@ taint() { cat /proc/sys/kernel/tainted; }
 
 # ------------------------------------------------------------------ builtins
 
+# GPU <ordinal>'s sysfs BDF (0000:06:00.0 form), via nvidia-smi.
+gpu_bdf() {
+    local b
+    b=$(nvidia-smi -i "$GPU" --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null)
+    [ -n "$b" ] || return 1
+    norm_bdf "$b"
+}
+
+# Largest BAR of <bdf>: prints "start size" (hex, no 0x).
+gpu_bar_range() {
+    awk '$1!="0x0000000000000000" {s=strtonum($1); e=strtonum($2);
+         if (e>s && e-s>max) {max=e-s; st=s}} END {if (max>0) printf "%x %x", st, max}' \
+        "/sys/bus/pci/devices/$1/resource" 2>/dev/null
+}
+
+# True if the PAT snapshot has a non-write-back entry overlapping [start,+size).
+# (Refreshes the snapshot first; takes hex start/size without 0x.)
+pat_snapshot_has_wc() {
+    refresh_pat
+    awk -v bstr="0x$1" -v szstr="0x$2" '
+        BEGIN { bs = strtonum(bstr); be = bs + strtonum(szstr) }
+        /write-back/ { next }
+        match($0, /0x[0-9a-fA-F]+-0x[0-9a-fA-F]+/) {
+            split(substr($0, RSTART, RLENGTH), r, "-")
+            cs = strtonum(r[1]); ce = strtonum(r[2])
+            if (cs < be && ce > bs) { found = 1 }
+        }
+        END { exit found ? 0 : 1 }' /run/phxfs/pat_memtype_list 2>/dev/null
+}
+
+# Start bar_holder in the background (mode args...); sets H_PID/H_LOG.
+wc_holder_start() {   # bdf mode [offMiB lenMiB] seconds
+    local bdf=$1; shift
+    H_LOG="$CASE_DIR/wc_holder.log"
+    $SUDO "$BIN/bar_holder" "$bdf" "$@" >"$H_LOG" 2>&1 &
+    H_PID=$!
+    local i
+    for i in $(seq 1 40); do
+        grep -q HOLDING "$H_LOG" && return 0
+        kill -0 $H_PID 2>/dev/null || break
+        sleep 0.25
+    done
+    echo "bar_holder never reached HOLDING:"; cat "$H_LOG"
+    kill $H_PID 2>/dev/null; wait $H_PID 2>/dev/null
+    return 1
+}
+
+wc_holder_stop() {
+    [ -n "${H_PID:-}" ] || return 0
+    $SUDO kill "$H_PID" 2>/dev/null
+    wait "$H_PID" 2>/dev/null
+    H_PID=""
+    sleep 0.5   # munmap frees the PAT entry before the caller reloads
+    cat "$H_LOG" 2>/dev/null
+}
+
+#
+# Load phoenixfs while a WC mapping covers the GPU BAR:
+#   whole BAR  -> the load must FAIL cleanly (PAT conflict), and the failure
+#                 must be the PAT path, NOT "refusing ... already has struct
+#                 pages" pointing at phoenixfs's own p2pdma slice (4ebe13f);
+#                 STAGING may instead succeed via the recovered slice.
+#   window     -> FULL must load and route around the conflicted block.
+# Afterwards the holder is released and the same mode must load again.
+# Usage: wc_case_block <full|staging> [offMiB lenMiB]
+# True if the running kernel was built with CONFIG_PCI_P2PDMA (the bootstrap
+# slice machinery only exists there; without it STAGING has nothing to conflict
+# with at load time and simply loads).
+kernel_has_p2pdma() {
+    grep -q "^#define CONFIG_PCI_P2PDMA 1" \
+        "/lib/modules/$(uname -r)/build/include/generated/autoconf.h" 2>/dev/null
+}
+
+wc_case_block() {
+    local mode=$1 window_off=${2:-} window_len=${3:-}
+    local whole=$([ -z "$window_off" ] && echo 1 || echo 0)
+    local bdf range start size ins_rc dlog
+    bdf=$(gpu_bdf) || { echo "cannot resolve GPU $GPU BDF"; return 1; }
+    range=$(gpu_bar_range "$bdf"); read -r start size <<<"$range"
+    [ -n "$start" ] || { echo "cannot read BAR of $bdf"; return 1; }
+    dlog="$CASE_DIR/wc_dmesg.log"
+
+    do_rmmod || return 1
+
+    if [ -n "$window_off" ]; then
+        echo "--- holder: window ${window_off}MiB+${window_len}MiB over $bdf (BAR 0x$start+0x$size)"
+        wc_holder_start "$bdf" window "$window_off" "$window_len" 600 || return 1
+    else
+        echo "--- holder: whole BAR 0x$start+0x$size over $bdf"
+        wc_holder_start "$bdf" full 600 || return 1
+    fi
+    if ! pat_snapshot_has_wc "$start" "$size"; then
+        echo "holder created no PAT conflict over the BAR (vacuous test)"
+        wc_holder_stop; return 1
+    fi
+    echo "PAT snapshot now has a non-write-back entry over the BAR, as intended"
+
+    $SUDO dmesg 2>/dev/null | wc -l >"$CASE_DIR/wc_dmesg_k0"
+    # debug on: the assertion below keys off phxfs_info messages
+    do_insmod "$mode" phxfs_debug=1 >"$CASE_DIR/wc_insmod.log" 2>&1
+    ins_rc=$?
+    $SUDO dmesg 2>/dev/null | tail -n +"$(($(cat "$CASE_DIR/wc_dmesg_k0") + 1))" >"$dlog"
+
+    if [ "$ins_rc" -eq 0 ]; then
+        if [ "$whole" = 0 ]; then
+            echo "FULL loaded, routing around the ${window_len}MiB WC window"
+        elif [ "$mode" = staging ] && grep -q "recovered existing p2pdma slice" "$dlog"; then
+            echo "staging loaded via the recovered slice (provider pre-exists)"
+        elif [ "$mode" = staging ] && ! kernel_has_p2pdma; then
+            echo "staging loaded: kernel has no CONFIG_PCI_P2PDMA, no bootstrap to conflict"
+        else
+            echo "insmod unexpectedly SUCCEEDED with a WC holder over the BAR"
+            wc_holder_stop; return 1
+        fi
+    else
+        mod_loaded && { echo "insmod failed but module is loaded"; wc_holder_stop; return 1; }
+        if grep -q "already has struct pages" "$dlog"; then
+            echo "REGRESSION: refused via the foreign-pgmap check instead of the PAT path"
+            grep -m2 "refusing" "$dlog"
+            wc_holder_stop; return 1
+        fi
+        if ! grep -qE "no PAT-conflict-free|fallback devm_memremap_pages failed|refusing full-BAR fallback" "$dlog"; then
+            echo "failed via an unexpected path:"; tail -5 "$dlog"
+            wc_holder_stop; return 1
+        fi
+        echo "load refused cleanly via the PAT path:"
+        grep -m3 -E "no remappable|no PAT-conflict-free|fallback devm_memremap_pages failed|refusing full-BAR fallback|npu_ctrl_init error" "$dlog"
+    fi
+
+    wc_holder_stop || return 1
+    do_rmmod || return 1     # staging-via-slice path may have loaded
+    do_insmod "$mode" || return 1
+    check_load "$mode" || return 1
+    echo "reloaded $mode cleanly after the holder released the BAR"
+}
+
 builtin_run() {   # mode-name, "@name args..."
     local mode=$1; shift
     local name=$1; shift
@@ -253,6 +389,10 @@ builtin_run() {   # mode-name, "@name args..."
         fi
         if mod_loaded; then echo "module left loaded"; return 1; fi
         echo "rejected as expected" ;;
+    @wc_hold_block)
+        wc_case_block "$1" ;;
+    @wc_partial)
+        wc_case_block full "$1" "$2" ;;
     @rmmod_busy)
         local log="$CASE_DIR/holder.log" pid i ok=0
         "$BIN/test_ioctl" "$GPU" hold 120 >"$log" 2>&1 &
@@ -452,6 +592,11 @@ if [ $DRY -eq 0 ]; then
     for c in "${CMDS[@]}"; do
         b=$(expand "$c"); b=${b%% *}
         [[ "$b" == @* ]] || [ -x "$b" ] || die "missing test binary: $b (build first)"
+    done
+    for c in "${CMDS[@]}"; do
+        case "$c" in @wc_hold_block*|@wc_partial*)
+            [ -x "$BIN/bar_holder" ] || die "missing $BIN/bar_holder (build the bar_holder target)" ;;
+        esac
     done
     if [ $needs_module -eq 1 ]; then
         [ -f "$KO" ] || die "module not found: $KO"
