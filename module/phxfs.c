@@ -252,6 +252,32 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 	/* Compute segments (skip conflicts, merge adjacent free blocks) */
 	n_segments = phxfs_compute_bar_segments(phx_dev->paddr, phx_dev->size,
 						conflicts, n_conflicts, &segs);
+	if (n_segments <= 0) {
+		/*
+		 * Every block is covered by foreign PAT entries (e.g. the GPU
+		 * driver's own whole-BAR write-combining ioremap). A plain
+		 * memtype entry carries no struct pages -- anything that does
+		 * carry struct pages was already refused by the foreign-pgmap
+		 * pre-checks -- so overlapping it is not the corruption case;
+		 * the kernel arbitrates the memtype conflict itself, either
+		 * tolerating the overlap or failing the remap cleanly with a
+		 * real errno. Retry with only phoenixfs's own p2pdma slice
+		 * excluded and let devm_memremap_pages() decide.
+		 */
+		if (phx_dev->p2p_slice_size) {
+			conflicts[0].start = phx_dev->p2p_slice_start;
+			conflicts[0].end = phx_dev->p2p_slice_start +
+					   phx_dev->p2p_slice_size;
+			n_conflicts = 1;
+		} else {
+			n_conflicts = 0;
+		}
+		phxfs_warn("phxfs%d: foreign PAT entries cover the whole BAR, "
+		       "retrying with only the p2pdma slice excluded\n",
+		       phx_dev->idx);
+		n_segments = phxfs_compute_bar_segments(phx_dev->paddr, phx_dev->size,
+						conflicts, n_conflicts, &segs);
+	}
 	kfree(conflicts);
 
 	if (n_segments <= 0) {

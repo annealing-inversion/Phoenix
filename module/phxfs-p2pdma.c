@@ -146,12 +146,18 @@ static int phxfs_p2pdma_recover_slice(struct phxfs_dev *phx_dev)
 		return -EEXIST;
 	}
 
-	phxfs_err("phxfs%d: p2pdma provider exists but its BAR slice "
-		   "could not be located\n", phx_dev->idx);
-	return -ENODEV;
+	/*
+	 * Provider exists but no slice: a previous load's add_resource attempt
+	 * failed after attaching the provider (e.g. into a kernel that
+	 * enforces PAT on memory-add). Self-heal by creating the slice now --
+	 * the foreign-pgmap scan above already cleared the BAR.
+	 */
+	phxfs_warn("phxfs%d: p2pdma provider exists but no slice found, "
+	       "re-creating the bootstrap slice\n", phx_dev->idx);
+	return phxfs_p2pdma_create_slice(phx_dev);
 }
 
-static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
+static int phxfs_p2pdma_create_slice(struct phxfs_dev *phx_dev)
 {
 	struct phxfs_pat_conflict *conflicts = NULL;
 	struct pci_dev *pdev = phx_dev->dev;
@@ -162,16 +168,15 @@ static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
 	if (phx_dev->bar < 0)
 		return -EINVAL;
 
-	if (pdev->p2pdma) {
-		return phxfs_p2pdma_recover_slice(phx_dev);
-	}
-
 	/*
 	 * No provider yet, so any pgmap in the BAR belongs to someone else
 	 * (e.g. the GPU driver remapped its own BAR). Bail out before
 	 * pci_p2pdma_add_resource(): it attaches a p2pdma provider to the GPU
 	 * device first and does not take it back when the remap then fails,
-	 * and its error path itself WARNs on some kernels.
+	 * and its error path itself WARNs on some kernels. This is the hard
+	 * safety boundary: foreign mappings that carry struct pages must
+	 * never be overlapped. Foreign PAT-only entries (plain ioremaps,
+	 * no struct pages) are handled below by letting the kernel arbitrate.
 	 */
 	if (phxfs_find_pgmap(phx_dev->paddr, phx_dev->size, 0, 0, &hit)) {
 		phxfs_report_pgmap(phx_dev, "use this GPU", &hit);
@@ -217,22 +222,31 @@ static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
 	}
 
 	if (!slice) {
-		phxfs_err("phxfs%d: no PAT-conflict-free %llu MiB block for the "
-		       "p2pdma bootstrap slice; check %s for mappings that "
-		       "cover the whole BAR (e.g. a whole-BAR write-combining "
-		       "remap by the GPU driver or a tool) -- phoenixfs needs "
-		       "the BAR free of foreign mappings\n",
-		       phx_dev->idx, PHXFS_REMAP_ALIGN >> 20, PHXFS_PAT_PATH);
-		ret = -ENOSPC;
-		goto out;
+		/*
+		 * Every block is covered by foreign PAT entries -- e.g. the
+		 * GPU driver's own whole-BAR write-combining ioremap. Those
+		 * carry no struct pages (struct pages were already refused by
+		 * the pre-check above), so overlapping them is not the
+		 * corruption case; the kernel arbitrates the memtype conflict
+		 * and fails pci_p2pdma_add_resource() cleanly where the
+		 * overlap is not allowed on this kernel.
+		 */
+		slice = span_start;
+		phxfs_warn("phxfs%d: every %llu MiB block is covered by foreign "
+		       "PAT entries (whole-BAR foreign memtype?); trying the "
+		       "first block and letting the kernel decide\n",
+		       phx_dev->idx, PHXFS_REMAP_ALIGN >> 20);
 	}
 
 	/* offset is relative to the start of the BAR */
 	ret = pci_p2pdma_add_resource(pdev, phx_dev->bar, PHXFS_REMAP_ALIGN,
 				      slice - phx_dev->paddr);
 	if (ret) {
-		phxfs_err("phxfs%d: p2pdma bootstrap failed (%d); on this kernel "
-		       "every DMA map of our BAR pages would fail with -EREMOTEIO\n",
+		phxfs_err("phxfs%d: p2pdma bootstrap failed (%d); a foreign "
+		       "memtype (e.g. the GPU driver's own whole-BAR "
+		       "write-combining remap) that this kernel refuses to "
+		       "overlap is a likely cause; on this kernel every DMA "
+		       "map of our BAR pages would fail with -EREMOTEIO\n",
 		       phx_dev->idx, ret);
 		goto out;
 	}
@@ -245,6 +259,19 @@ static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
 out:
 	kvfree(conflicts);
 	return ret;
+}
+
+static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
+{
+	struct pci_dev *pdev = phx_dev->dev;
+
+	if (phx_dev->bar < 0)
+		return -EINVAL;
+
+	if (pdev->p2pdma)
+		return phxfs_p2pdma_recover_slice(phx_dev);
+
+	return phxfs_p2pdma_create_slice(phx_dev);
 }
 
 /*
