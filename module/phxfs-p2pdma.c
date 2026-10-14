@@ -89,74 +89,6 @@ void phxfs_report_pgmap(struct phxfs_dev *dev, const char *what,
 
 #ifdef CONFIG_PCI_P2PDMA
 
-/* pci_p2pdma_add_resource() installs a devm-owned pgmap that survives a
- * phoenixfs unload. Recover its BAR location on the next load so FULL mode
- * can exclude that range instead of attempting a conflicting remap. */
-static int phxfs_p2pdma_recover_slice(struct phxfs_dev *phx_dev)
-{
-	struct phxfs_pgmap_hit foreign = { 0 };
-	bool have_foreign = false;
-	u64 off, found = 0;
-	int matches = 0;
-
-	for (off = 0; off + PHXFS_REMAP_ALIGN <= phx_dev->size;
-	     off += PHXFS_REMAP_ALIGN) {
-		struct dev_pagemap *pg;
-		u64 range_start, range_end;
-
-		if (((off / PHXFS_REMAP_ALIGN) & 4095) == 4095)
-			cond_resched();
-		pg = get_dev_pagemap(PHYS_PFN(phx_dev->paddr + off), NULL);
-		if (!pg)
-			continue;
-		pgmap_range_of(pg, &range_start, &range_end);
-		/* Our slice: a P2PDMA pgmap covering exactly this sub-section. */
-		if (pg->type == MEMORY_DEVICE_PCI_P2PDMA &&
-		    range_start == phx_dev->paddr + off &&
-		    range_end == phx_dev->paddr + off + PHXFS_REMAP_ALIGN - 1) {
-			found = phx_dev->paddr + off;
-			matches++;
-		} else if (!have_foreign) {
-			have_foreign = true;
-			foreign.addr = phx_dev->paddr + off;
-			foreign.start = range_start;
-			foreign.end = range_end;
-			foreign.type = pg->type;
-		}
-		put_dev_pagemap(pg);
-	}
-
-	if (have_foreign) {
-		phxfs_report_pgmap(phx_dev, "use this GPU", &foreign);
-		return -EBUSY;
-	}
-
-	if (matches == 1) {
-		phx_dev->p2p_slice_start = found;
-		phx_dev->p2p_slice_size = PHXFS_REMAP_ALIGN;
-		phxfs_info("phxfs%d: recovered existing p2pdma slice "
-		       "[0x%llx+0x%llx)\n", phx_dev->idx,
-		       phx_dev->p2p_slice_start, phx_dev->p2p_slice_size);
-		return 0;
-	}
-	if (matches > 1) {
-		phxfs_err("phxfs%d: found %d candidate p2pdma slices; "
-			   "refusing ambiguous BAR recovery\n",
-			   phx_dev->idx, matches);
-		return -EEXIST;
-	}
-
-	/*
-	 * Provider exists but no slice: a previous load's add_resource attempt
-	 * failed after attaching the provider (e.g. into a kernel that
-	 * enforces PAT on memory-add). Self-heal by creating the slice now --
-	 * the foreign-pgmap scan above already cleared the BAR.
-	 */
-	phxfs_warn("phxfs%d: p2pdma provider exists but no slice found, "
-	       "re-creating the bootstrap slice\n", phx_dev->idx);
-	return phxfs_p2pdma_create_slice(phx_dev);
-}
-
 static int phxfs_p2pdma_create_slice(struct phxfs_dev *phx_dev)
 {
 	struct phxfs_pat_conflict *conflicts = NULL;
@@ -259,6 +191,74 @@ static int phxfs_p2pdma_create_slice(struct phxfs_dev *phx_dev)
 out:
 	kvfree(conflicts);
 	return ret;
+}
+
+/* pci_p2pdma_add_resource() installs a devm-owned pgmap that survives a
+ * phoenixfs unload. Recover its BAR location on the next load so FULL mode
+ * can exclude that range instead of attempting a conflicting remap. */
+static int phxfs_p2pdma_recover_slice(struct phxfs_dev *phx_dev)
+{
+	struct phxfs_pgmap_hit foreign = { 0 };
+	bool have_foreign = false;
+	u64 off, found = 0;
+	int matches = 0;
+
+	for (off = 0; off + PHXFS_REMAP_ALIGN <= phx_dev->size;
+	     off += PHXFS_REMAP_ALIGN) {
+		struct dev_pagemap *pg;
+		u64 range_start, range_end;
+
+		if (((off / PHXFS_REMAP_ALIGN) & 4095) == 4095)
+			cond_resched();
+		pg = get_dev_pagemap(PHYS_PFN(phx_dev->paddr + off), NULL);
+		if (!pg)
+			continue;
+		pgmap_range_of(pg, &range_start, &range_end);
+		/* Our slice: a P2PDMA pgmap covering exactly this sub-section. */
+		if (pg->type == MEMORY_DEVICE_PCI_P2PDMA &&
+		    range_start == phx_dev->paddr + off &&
+		    range_end == phx_dev->paddr + off + PHXFS_REMAP_ALIGN - 1) {
+			found = phx_dev->paddr + off;
+			matches++;
+		} else if (!have_foreign) {
+			have_foreign = true;
+			foreign.addr = phx_dev->paddr + off;
+			foreign.start = range_start;
+			foreign.end = range_end;
+			foreign.type = pg->type;
+		}
+		put_dev_pagemap(pg);
+	}
+
+	if (have_foreign) {
+		phxfs_report_pgmap(phx_dev, "use this GPU", &foreign);
+		return -EBUSY;
+	}
+
+	if (matches == 1) {
+		phx_dev->p2p_slice_start = found;
+		phx_dev->p2p_slice_size = PHXFS_REMAP_ALIGN;
+		phxfs_info("phxfs%d: recovered existing p2pdma slice "
+		       "[0x%llx+0x%llx)\n", phx_dev->idx,
+		       phx_dev->p2p_slice_start, phx_dev->p2p_slice_size);
+		return 0;
+	}
+	if (matches > 1) {
+		phxfs_err("phxfs%d: found %d candidate p2pdma slices; "
+			   "refusing ambiguous BAR recovery\n",
+			   phx_dev->idx, matches);
+		return -EEXIST;
+	}
+
+	/*
+	 * Provider exists but no slice: a previous load's add_resource attempt
+	 * failed after attaching the provider (e.g. into a kernel that
+	 * enforces PAT on memory-add). Self-heal by creating the slice now --
+	 * the foreign-pgmap scan above already cleared the BAR.
+	 */
+	phxfs_warn("phxfs%d: p2pdma provider exists but no slice found, "
+	       "re-creating the bootstrap slice\n", phx_dev->idx);
+	return phxfs_p2pdma_create_slice(phx_dev);
 }
 
 static int phxfs_p2pdma_bootstrap(struct phxfs_dev *phx_dev)
