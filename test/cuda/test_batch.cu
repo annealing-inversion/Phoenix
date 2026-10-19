@@ -11,7 +11,7 @@
 //          ngpu      - worker count (default: all visible GPUs, capped 8)
 //          gpu_start - first GPU index (default 0)
 //          mode      - read (default) | write | both
-//          api       - sync (default) | async (submit/wait pipelining)
+//          api       - sync (default) | async (cancel checks + submit/wait pipelining)
 
 
 #include <cstdio>
@@ -152,7 +152,14 @@ static int run_async_batches(phxfs_io_req_t *reqs, int nreq, int do_write) {
         /* Submit blocks when the pool's shared queue is full (backpressure),
          * so it cannot fail with EBUSY regardless of how many GPU workers
          * pipeline concurrently. NULL means a genuine error. */
-        if (!h) { printf("async submit: %s\n", strerror(errno)); return -1; }
+        if (!h) {
+            printf("async submit: %s\n", strerror(errno));
+            for (phxfs_batch_t *pending : win) {
+                phxfs_batch_cancel(pending);
+                phxfs_batch_destroy(pending);
+            }
+            return -1;
+        }
         win.push_back(h);
         if ((int)win.size() >= kWindow) {
             int w = phxfs_batch_wait(win.front());
@@ -167,8 +174,53 @@ static int run_async_batches(phxfs_io_req_t *reqs, int nreq, int do_write) {
     return failed;
 }
 
+static bool run_cancel_batch(phxfs_io_req_t *reqs, int nreq, int do_write,
+                             int gpu, bool destroy) {
+    std::vector<phxfs_io_req_t> pending(reqs, reqs + nreq);
+    phxfs_batch_t *h = do_write
+        ? phxfs_batch_submit_write(pending.data(), nreq)
+        : phxfs_batch_submit_read(pending.data(), nreq);
+    if (!h) {
+        printf("gpu%d cancel submit: %s\n", gpu, strerror(errno));
+        return false;
+    }
+    int cancel = phxfs_batch_cancel(h);
+    int repeat = phxfs_batch_cancel(h);
+    bool ok = cancel == 0 && repeat == 0;
+    if (destroy) {
+        int rc = phxfs_batch_destroy(h);
+        printf("gpu%d cancel/destroy %s: cancel=%d repeat=%d destroy=%d\n",
+               gpu, do_write ? "write" : "read", cancel, repeat, rc);
+        return ok && rc == 0;
+    }
+
+    int rc = phxfs_batch_wait(h);
+    int canceled = 0, completed = 0, partial = 0, failed = 0;
+    for (int i = 0; i < nreq; i++) {
+        ssize_t result = pending[i].result;
+        if (result == (ssize_t)pending[i].nbytes) {
+            completed++;
+        } else {
+            failed++;
+            if (result == -ECANCELED)
+                canceled++;
+            else if (result > 0 && result < (ssize_t)pending[i].nbytes)
+                partial++;
+            else {
+                printf("gpu%d cancel result[%d]=%zd\n", gpu, i, result);
+                ok = false;
+            }
+        }
+    }
+    printf("gpu%d cancel/wait %s: cancel=%d repeat=%d wait=%d "
+           "completed=%d canceled=%d partial=%d\n", gpu,
+           do_write ? "write" : "read", cancel, repeat, rc,
+           completed, canceled, partial);
+    return ok && rc == failed;
+}
+
 // ---- per-GPU worker: own GPU, own file, own ring (thread_local) ----
-struct worker_result { double secs; size_t bytes; bool ok; };
+struct worker_result { double secs; size_t bytes; bool ok; bool cancel_ok; };
 
 // Prepare each GPU's file up front (NOT timed).
 static bool prepare_files(int ngpu, int gpu_start, const char *base_file) {
@@ -195,6 +247,7 @@ static bool prepare_files(int ngpu, int gpu_start, const char *base_file) {
 static void gpu_worker(int gpu, const char *base_file, int do_write,
                        int async_api, worker_result *out) {
     out->ok = false; out->bytes = 0; out->secs = 0;
+    out->cancel_ok = !async_api;
 
     if (cudaSetDevice(gpu) != cudaSuccess) { printf("gpu%d: cudaSetDevice failed\n", gpu); return; }
     int dev = gpu;
@@ -247,6 +300,12 @@ static void gpu_worker(int gpu, const char *base_file, int do_write,
         reqs[i].f_offset   = (off_t)i * CHUNK;   // distinct file region
     }
 
+    if (async_api) {
+        bool waited = run_cancel_batch(reqs.data(), NREQ, do_write, gpu, false);
+        bool destroyed = run_cancel_batch(reqs.data(), REQS, do_write, gpu, true);
+        out->cancel_ok = waited && destroyed;
+    }
+
     posix_fadvise(dfd, 0, file_bytes, POSIX_FADV_DONTNEED);
     double t0 = now_sec();
     int rc = async_api ? run_async_batches(reqs.data(), NREQ, do_write)
@@ -297,7 +356,9 @@ static bool run_phase(const char *label, int do_write, int async_api, int ngpu,
     size_t total_bytes = 0;
     double max_batch_ms = 0;
     bool all_ok = true;
+    bool cancel_ok = true;
     for (int g = 0; g < ngpu; g++) {
+        cancel_ok = cancel_ok && res[g].cancel_ok;
         if (!res[g].ok) { all_ok = false; printf("  gpu%d: FAILED\n", gpu_start + g); continue; }
         double gib = (double)res[g].bytes / GiB;
         printf("  gpu%d: %6.2f GiB in %7.3f ms -> %6.2f GiB/s\n",
@@ -312,8 +373,10 @@ static bool run_phase(const char *label, int do_write, int async_api, int ngpu,
     printf("  aggregate: %.2f GiB / %.3f ms -> %.2f GiB/s (%.2f GB/s)\n",
            tgib, max_batch_ms, tgib / (max_batch_ms / 1e3),
            (double)total_bytes / 1e9 / (max_batch_ms / 1e3));
+    if (async_api)
+        CHECK(cancel_ok, "%s: GPU cancel/wait/destroy", label);
     CHECK(all_ok, "%s: all workers completed", label);
-    return all_ok;
+    return all_ok && cancel_ok;
 }
 
 int main(int argc, char **argv) {
