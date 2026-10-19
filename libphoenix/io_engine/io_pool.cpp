@@ -194,6 +194,18 @@ static void job_remove_locked(struct pool_state *p, struct pool_job *job) {
     job->next = NULL;
 }
 
+static void job_complete_locked(struct pool_state *p, struct pool_job *job) {
+    if (job->done || job->completed != job->n)
+        return;
+    job->done = true;
+    job_remove_locked(p, job);
+    p->inflight--;
+    pthread_cond_broadcast(&p->done_cv);
+    pthread_cond_signal(&p->free_cv);
+    if (p->stop && p->inflight == 0)
+        pthread_cond_broadcast(&p->work_cv);
+}
+
 static void *worker_main(void *arg) {
     struct pool_state *p = &g_pool;
     struct worker *worker = (struct worker *)arg;
@@ -231,15 +243,7 @@ static void *worker_main(void *arg) {
         if (job->err == 0 && lerr < 0)
             job->err = lerr;
         job->completed += cnt;
-        if (job->completed == job->n) {
-            job->done = true;
-            job_remove_locked(p, job);
-            p->inflight--;
-            pthread_cond_broadcast(&p->done_cv);   /* wake this job's waiter */
-            pthread_cond_signal(&p->free_cv);      /* a queue slot freed */
-            if (p->stop && p->inflight == 0)
-                pthread_cond_broadcast(&p->work_cv);  /* release idle workers */
-        }
+        job_complete_locked(p, job);
     }
 }
 
@@ -472,6 +476,26 @@ struct phxfs_pool_async *phxfs_pool_submit(struct phxfs_io_op_req *reqs, int n,
         return NULL;
     }
     return h;
+}
+
+int phxfs_pool_cancel(struct phxfs_pool_async *h) {
+    if (!h)
+        return -EINVAL;
+    if (h->inline_done)
+        return 0;
+
+    struct pool_state *p = h->p;
+    struct pool_job *job = &h->job;
+    pthread_mutex_lock(&p->mtx);
+    int pending = job->n - job->claimed;
+    for (int i = job->claimed; i < job->n; i++)
+        job->reqs[i].result = -ECANCELED;
+    job->claimed = job->n;
+    job->completed += pending;
+    job->failed += pending;
+    job_complete_locked(p, job);
+    pthread_mutex_unlock(&p->mtx);
+    return 0;
 }
 
 int phxfs_pool_wait(struct phxfs_pool_async *h) {

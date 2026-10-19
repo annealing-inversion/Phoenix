@@ -16,6 +16,7 @@
 static std::mutex lock;
 static std::condition_variable changed;
 static bool copy_entered, copy_done, hold_copy, wait_entered, dereg_done;
+static int copies_entered;
 static thread_local bool dereg_thread = false;
 static int failures = 0;
 static int (*real_h2d)(void *, const void *, size_t);
@@ -52,6 +53,7 @@ static int gated_copy(void *d, const void *s, size_t n,
     {
         std::unique_lock<std::mutex> guard(lock);
         copy_entered = true;
+        copies_entered++;
         changed.notify_all();
         changed.wait(guard, [] { return !hold_copy; });
     }
@@ -98,6 +100,8 @@ static void scenario(int fd, void *gpu, bool write, bool destroy,
     }
     if (!bad_fd)
         await([&] { return completed_copy ? copy_done : copy_entered; });
+    if (!synchronous && !bad_fd)
+        check(phxfs_batch_cancel(batch) == 0, "cancel keeps refs until wait/destroy");
 
     require(phxfs_deregmem(0, gpu, bytes) == 0,
             "non-final registration reference drops without blocking");
@@ -145,6 +149,86 @@ static void scenario(int fd, void *gpu, bool write, bool destroy,
     }
 }
 
+static void cancel_scenario(int fd, void *gpu, bool write, bool destroy) {
+    printf("CASE cancel write=%d destroy=%d\n", write, destroy);
+    void *target = nullptr;
+    require(phxfs_regmem(0, gpu, bytes, &target) == 0, "register for cancellation");
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        copies_entered = 0;
+        hold_copy = true;
+    }
+    phxfs_io_req_t blockers[4]{};
+    phxfs_batch_t *handles[4]{};
+    for (int i = 0; i < 4; i++) {
+        blockers[i].fd = fd;
+        blockers[i].device_id = 0;
+        blockers[i].buf = gpu;
+        blockers[i].nbytes = bytes;
+        handles[i] = phxfs_batch_submit_read(&blockers[i], 1);
+        require(handles[i] != nullptr, "submit HOST worker blocker");
+    }
+    await([] { return copies_entered == 4; });
+    phxfs_io_req_t reqs[2]{};
+    for (int i = 0; i < 2; i++) {
+        reqs[i].fd = fd;
+        reqs[i].device_id = 0;
+        reqs[i].buf = gpu;
+        reqs[i].buf_offset = i * (bytes / 2);
+        reqs[i].f_offset = i * (bytes / 2);
+        reqs[i].nbytes = bytes / 2;
+    }
+    auto *batch = write ? phxfs_batch_submit_write(reqs, 2)
+                        : phxfs_batch_submit_read(reqs, 2);
+    require(batch != nullptr, "submit merged HOST requests");
+    check(phxfs_batch_cancel(batch) == 0, "cancel pending HOST work");
+    check(phxfs_batch_cancel(batch) == 0, "repeat HOST cancellation");
+    if (destroy) {
+        check(phxfs_batch_destroy(batch) == 0, "destroy canceled HOST batch");
+        check(reqs[0].result == 0 && reqs[1].result == 0, "HOST destroy skips result copy-back");
+    } else {
+        check(phxfs_batch_wait(batch) == 2, "HOST cancellation counts original requests");
+        check(reqs[0].result == -ECANCELED && reqs[1].result == -ECANCELED,
+              "merged HOST requests report cancellation");
+    }
+    check(phxfs_batch_cancel(handles[0]) == 0, "cancel claimed HOST work without waiting");
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        check(copies_entered == 4, "canceled HOST work starts no copies");
+        hold_copy = false;
+        changed.notify_all();
+    }
+    for (int i = 0; i < 4; i++) {
+        check(phxfs_batch_wait(handles[i]) == 0, "claimed HOST work drains normally");
+        check(blockers[i].result == (ssize_t)bytes, "claimed HOST result preserved");
+    }
+    check(phxfs_deregmem(0, gpu, bytes) == 0, "cancellation releases mapping refs");
+}
+
+static void cancel_staging_scenario(int fd, void *gpu) {
+    mbuffer[0].map_mode = PHX_MAP_MODE_STAGING;
+    phxfs_io_req_t req{};
+    req.fd = fd;
+    req.device_id = 0;
+    req.buf = gpu;
+    req.nbytes = bytes;
+    req.result = -1;
+    auto *batch = phxfs_batch_submit_read(&req, 1);
+    require(batch != nullptr, "submit deferred STAGING batch");
+    check(phxfs_batch_cancel(batch) == 0, "cancel deferred STAGING batch");
+    check(phxfs_batch_cancel(batch) == 0, "repeat STAGING cancellation");
+    check(req.result == -1, "STAGING cancel defers results to wait");
+    check(phxfs_batch_wait(batch) == 1 && req.result == -ECANCELED,
+          "STAGING wait skips transfer and reports cancellation");
+    req.result = -1;
+    batch = phxfs_batch_submit_write(&req, 1);
+    require(batch != nullptr, "submit deferred STAGING write");
+    check(phxfs_batch_cancel(batch) == 0 && phxfs_batch_destroy(batch) == 0,
+          "cancel/destroy deferred STAGING write");
+    check(req.result == -1, "STAGING destroy does not copy results");
+    mbuffer[0].map_mode = PHX_MAP_MODE_HOST;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     alarm(40);
@@ -171,6 +255,10 @@ int main(int argc, char **argv) {
     scenario(fd, gpu, false, false, true, false, false);
     scenario(fd, gpu, false, false, false, true, false);
     scenario(fd, gpu, false, false, false, false, true);
+    cancel_scenario(fd, gpu, false, false);
+    cancel_scenario(fd, gpu, true, false);
+    cancel_scenario(fd, gpu, true, true);
+    cancel_staging_scenario(fd, gpu);
     devconn->memcpy_h2d = real_h2d;
     devconn->memcpy_d2h = real_d2h;
     close(fd);

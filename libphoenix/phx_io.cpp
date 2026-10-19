@@ -460,7 +460,7 @@ static int host_batch_finalize(host_batch_ctx *bc) {
         for (int j = 0; j < slice.req_count && remaining > 0; j++) {
             phxfs_io_req_t &req = bc->reqs[slice.first_req + j];
             size_t add = std::min(remaining, req.nbytes);
-            req.result += (ssize_t)add;
+            req.result = (req.result > 0 ? req.result : 0) + (ssize_t)add;
             remaining -= add;
         }
         if (op_result < 0) {
@@ -736,6 +736,7 @@ struct phxfs_batch {
     phxfs_io_req_t          *reqs;     /* user array, for result copy-back */
     bool                     joined;   /* wait()/destroy() already consumed this handle */
     bool                     staging;  /* staging-mode batch: run at wait() time */
+    bool                     canceled;
     int                      staging_n;
     int                      staging_is_write;
     host_batch_ctx          *host_bc;
@@ -813,6 +814,14 @@ phxfs_batch_t *phxfs_batch_submit_write(phxfs_io_req_t *reqs, int n) {
     return phxfs_batch_submit(reqs, n, PHXFS_IO_WRITE);
 }
 
+int phxfs_batch_cancel(phxfs_batch_t *h) {
+    if (!h || h->joined)
+        return -EINVAL;
+    PHX_RANGE("phx.batch.cancel");
+    h->canceled = true;
+    return h->pool_h ? phxfs_pool_cancel(h->pool_h) : 0;
+}
+
 int phxfs_batch_wait(phxfs_batch_t *h) {
     if (!h)
         return -EINVAL;
@@ -825,7 +834,14 @@ int phxfs_batch_wait(phxfs_batch_t *h) {
     PHX_RANGE("phx.batch.wait");
 
     if (h->staging) {
-        int fails = phx_staging_batch(h->reqs, h->staging_n, h->staging_is_write);
+        int fails;
+        if (h->canceled) {
+            for (int i = 0; i < h->staging_n; i++)
+                h->reqs[i].result = -ECANCELED;
+            fails = h->staging_n;
+        } else {
+            fails = phx_staging_batch(h->reqs, h->staging_n, h->staging_is_write);
+        }
         free(h);
         return fails;
     }
@@ -857,8 +873,8 @@ int phxfs_batch_wait(phxfs_batch_t *h) {
 }
 
 /*
- * Abandon an async batch: wait for in-flight I/O to quiesce (submitted I/O
- * cannot be cancelled), then release the held device/mapping refs and free
+ * Abandon an async batch: wait for outstanding work to quiesce without
+ * requesting cancellation, then release the held device/mapping refs and free
  * the handle WITHOUT copying results back. Gives a caller that drops a batch
  * a defined way to release the pool and all references instead of leaking
  * them until process exit. Returns 0, or -EINVAL for NULL/already-joined.

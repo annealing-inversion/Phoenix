@@ -4,10 +4,13 @@
 // internally, so it needs neither a GPU nor the phxfs kernel module.
 
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,6 +18,7 @@
 #include <unistd.h>
 
 #include "phoenix.h"
+#include "../libphoenix/io_engine/io_engine.h"
 
 namespace {
 
@@ -53,6 +57,130 @@ void fill_pattern(std::vector<uint8_t> &buf, int request, size_t len) {
         buf[kPrefix + i] = static_cast<uint8_t>((request * 67 + i) & 0xff);
 }
 
+struct WorkerGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int entered = 0;
+    bool released = false;
+};
+
+int gate_prepare(phxfs_io_op_req *op, phxfs_io_op,
+                 phxfs_io_worker_ctx *, int) {
+    auto *gate = static_cast<WorkerGate *>(op->private_data);
+    std::unique_lock<std::mutex> guard(gate->mutex);
+    gate->entered++;
+    gate->cv.notify_all();
+    gate->cv.wait(guard, [&] { return gate->released; });
+    return 0;
+}
+
+void wait_for_workers(WorkerGate &gate) {
+    std::unique_lock<std::mutex> guard(gate.mutex);
+    if (!gate.cv.wait_for(guard, std::chrono::seconds(10), [&] {
+            return gate.entered == PHXFS_POOL_THREADS;
+        })) {
+        std::fprintf(stderr, "worker gate timed out\n");
+        std::_Exit(2);
+    }
+}
+
+void release_workers(WorkerGate &gate) {
+    std::lock_guard<std::mutex> guard(gate.mutex);
+    gate.released = true;
+    gate.cv.notify_all();
+}
+
+void test_cancel(int fd) {
+    WorkerGate gate;
+    uint8_t scratch[PHXFS_POOL_THREADS]{};
+    phxfs_io_op_req blockers[PHXFS_POOL_THREADS]{};
+    for (int i = 0; i < PHXFS_POOL_THREADS; i++) {
+        blockers[i].fd = fd;
+        blockers[i].host_addr = &scratch[i];
+        blockers[i].nbytes = 1;
+        blockers[i].prepare = gate_prepare;
+        blockers[i].private_data = &gate;
+    }
+    auto *block = phxfs_pool_submit(blockers, PHXFS_POOL_THREADS,
+                                    PHXFS_IO_READ, true);
+    CHECK(block != nullptr, "submit worker blockers");
+    if (!block)
+        return;
+    wait_for_workers(gate);
+
+    uint8_t buffer[32];
+    std::memset(buffer, 0xa5, sizeof(buffer));
+    phxfs_io_req_t reqs[2]{};
+    reqs[0].fd = fd;
+    reqs[0].device_id = -1;
+    reqs[0].buf = buffer;
+    reqs[0].nbytes = sizeof(buffer);
+    reqs[0].result = -1;
+    reqs[1] = reqs[0];
+    reqs[1].buf_offset = -1;
+    auto *h = phxfs_batch_submit_read(reqs, 2);
+    CHECK(h && phxfs_batch_cancel(h) == 0, "cancel queued read");
+    CHECK(h && phxfs_batch_cancel(h) == 0, "repeated cancel is idempotent");
+    CHECK(reqs[0].result == -1, "cancel defers result copy-back to wait");
+    CHECK(h && phxfs_batch_wait(h) == 2, "wait counts canceled and invalid requests");
+    CHECK(reqs[0].result == -ECANCELED && reqs[1].result == -EFAULT,
+          "cancel preserves submission-time errors");
+    bool unchanged = true;
+    for (uint8_t byte : buffer)
+        unchanged = unchanged && byte == 0xa5;
+    CHECK(unchanged, "canceled read leaves buffer untouched");
+
+    off_t end = lseek(fd, 0, SEEK_END);
+    reqs[0].f_offset = end + 4096;
+    h = phxfs_batch_submit_write(reqs, 1);
+    CHECK(h && phxfs_batch_cancel(h) == 0, "cancel queued write");
+    CHECK(h && phxfs_batch_wait(h) == 1 && reqs[0].result == -ECANCELED,
+          "canceled write reports ECANCELED");
+    CHECK(lseek(fd, 0, SEEK_END) == end, "canceled write does not extend file");
+
+    bool recycled = true;
+    for (int i = 0; i < 32; i++) {
+        reqs[0].result = -1;
+        h = phxfs_batch_submit_write(reqs, 1);
+        if (!h) {
+            recycled = false;
+            break;
+        }
+        recycled = phxfs_batch_cancel(h) == 0 && recycled;
+        recycled = phxfs_batch_destroy(h) == 0 && recycled;
+        recycled = reqs[0].result == -1 && recycled;
+    }
+    CHECK(recycled, "cancel/destroy recycles queue slots without copying results");
+    release_workers(gate);
+    CHECK(phxfs_pool_cancel(block) == 0, "cancel with all work already claimed");
+    CHECK(phxfs_pool_wait(block) == 0, "claimed work completes normally");
+
+    WorkerGate partial_gate;
+    constexpr int n = 32;
+    uint8_t partial_buf[n]{};
+    phxfs_io_op_req ops[n]{};
+    for (int i = 0; i < n; i++) {
+        ops[i].fd = fd;
+        ops[i].host_addr = &partial_buf[i];
+        ops[i].nbytes = 1;
+        ops[i].prepare = gate_prepare;
+        ops[i].private_data = &partial_gate;
+    }
+    auto *partial = phxfs_pool_submit(ops, n, PHXFS_IO_READ, true);
+    CHECK(partial != nullptr, "submit partially claimed job");
+    if (!partial)
+        return;
+    wait_for_workers(partial_gate);
+    CHECK(phxfs_pool_cancel(partial) == 0, "cancel partially claimed job without waiting");
+    release_workers(partial_gate);
+    int expected = n - PHXFS_POOL_THREADS * PHXFS_HOST_STAGE_SLOTS;
+    CHECK(phxfs_pool_wait(partial) == expected, "partial cancellation failure count");
+    bool correct = true;
+    for (int i = 0; i < n; i++)
+        correct = correct && ops[i].result == (i < n - expected ? 1 : -ECANCELED);
+    CHECK(correct, "claimed ops complete; unclaimed ops are canceled");
+}
+
 }  // namespace
 
 int main() {
@@ -65,12 +193,15 @@ int main() {
     /* Empty batches still yield a consumable handle. */
     phxfs_batch_t *h = phxfs_batch_submit_read(nullptr, 0);
     CHECK(h != nullptr, "empty read batch returns a handle");
+    CHECK(h && phxfs_batch_cancel(h) == 0, "cancel empty batch");
+    CHECK(h && phxfs_batch_cancel(h) == 0, "repeat cancel empty batch");
     CHECK(h && phxfs_batch_wait(h) == 0, "empty read batch wait");
     h = phxfs_batch_submit_write(nullptr, 0);
     CHECK(h != nullptr, "empty write batch returns a handle");
     CHECK(h && phxfs_batch_wait(h) == 0, "empty write batch wait");
 
     /* Bad-handle plumbing. */
+    CHECK(phxfs_batch_cancel(nullptr) == -EINVAL, "cancel on NULL handle");
     CHECK(phxfs_batch_wait(nullptr) == -EINVAL, "wait on NULL handle");
     CHECK(phxfs_batch_destroy(nullptr) == -EINVAL, "destroy on NULL handle");
 
@@ -248,8 +379,7 @@ int main() {
     h = phxfs_batch_submit_read(&eof, 1);
     CHECK(h != nullptr, "resubmit for lifetime test");
     CHECK(h && phxfs_batch_wait(h) == 1, "first wait consumes the handle");
-    CHECK(phxfs_batch_wait(h) == -EINVAL, "second wait rejected");
-    CHECK(phxfs_batch_destroy(h) == -EINVAL, "destroy after wait rejected");
+    h = nullptr;
 
     /* destroy() frees a batch without copying results back, but the
      * already-submitted I/O still lands. */
@@ -273,6 +403,7 @@ int main() {
                                    drop_dst.data(), 512) == 0,
           "destroyed write batch still landed on disk");
 
+    test_cancel(fd);
     close(fd);
     std::printf("=== %d checks, %d failed ===\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

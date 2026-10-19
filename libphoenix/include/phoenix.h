@@ -166,14 +166,25 @@ int phxfs_write_batch(phxfs_io_req_t *reqs, int n);
  * ESHUTDOWN if the library is being unloaded).
  * phxfs_batch_wait returns the number of failed requests (>=0), or negative
  * on error, copies per-request results back, and frees the handle.
- * phxfs_batch_destroy abandons a batch: it waits for in-flight I/O to quiesce
- * (submitted I/O cannot be cancelled), then frees the handle WITHOUT copying
- * results back — for callers that drop a batch without needing its results.
+ * phxfs_batch_cancel makes a best-effort attempt to cancel pending work.
+ * Work already claimed by a worker may still complete; completed results and
+ * writes are not undone. Returns 0 on success (including repeated cancellation
+ * or an already-completed batch), or -EINVAL for a NULL handle. It neither
+ * waits nor frees the handle: wait/destroy is still required before releasing
+ * any request resources. wait reports canceled requests as -ECANCELED, or
+ * preserves positive byte counts for requests that made partial progress;
+ * canceled/short requests count as failures. STAGING batches canceled before
+ * wait do not start their deferred transfer. Serialize cancel/wait/destroy
+ * calls on the same handle; never use a handle after wait/destroy.
+ * phxfs_batch_destroy abandons a batch: it waits for outstanding work to
+ * quiesce, then frees the handle WITHOUT copying results back. It does not
+ * request cancellation; call cancel first to discard pending work as well.
  */
 typedef struct phxfs_batch phxfs_batch_t;
 
 phxfs_batch_t *phxfs_batch_submit_read(phxfs_io_req_t *reqs, int n);
 phxfs_batch_t *phxfs_batch_submit_write(phxfs_io_req_t *reqs, int n);
+int phxfs_batch_cancel(phxfs_batch_t *handle);
 int phxfs_batch_wait(phxfs_batch_t *handle);
 int phxfs_batch_destroy(phxfs_batch_t *handle);
 
