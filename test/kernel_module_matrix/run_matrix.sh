@@ -4,7 +4,7 @@
 #
 # The matrix itself lives in matrix.conf (format documented there).
 #
-# Usage: test/matrix/run_matrix.sh [options]
+# Usage: test/kernel_module_matrix/run_matrix.sh [options]
 #   --ko PATH          phoenixfs.ko to insmod (default: <build>/module/phoenixfs.ko).
 #                      With module.sig_enforce=1 this must be a signed copy.
 #   --build DIR        build tree with bin/ (default: <repo>/build)
@@ -22,9 +22,9 @@
 #   -h | --help
 #
 # Examples:
-#   test/matrix/run_matrix.sh --ko /tmp/phoenixfs.ko
-#   test/matrix/run_matrix.sh --ko /tmp/phoenixfs.ko --only '^full\.ioctl'
-#   test/matrix/run_matrix.sh --only '^(cpu|host|auto\.nomodule)\.'   # no module needed
+#   test/kernel_module_matrix/run_matrix.sh --ko /tmp/phoenixfs.ko
+#   test/kernel_module_matrix/run_matrix.sh --ko /tmp/phoenixfs.ko --only '^full\.ioctl'
+#   test/kernel_module_matrix/run_matrix.sh --only '^(cpu|host|auto\.nomodule)\.'   # no module needed
 #
 # Exit status: 0 if every selected case passed, 1 otherwise, 2 on setup error.
 

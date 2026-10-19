@@ -24,10 +24,10 @@ add_dependencies (test_batch_async libphoenix)
 target_include_directories (test_batch_async PRIVATE "${phoenix_include}")
 target_link_libraries (test_batch_async libphoenix Threads::Threads)
 
-# Helper for the test matrix (test/matrix/run_matrix.sh): holds a WC mapping
+# Helper for the test matrix (test/kernel_module_matrix/run_matrix.sh): holds a WC mapping
 # over a GPU BAR via sysfs resource*_wc to exercise phoenixfs's PAT-conflict
 # handling at load time. Plain C, no GPU runtime and no libphoenix needed.
-add_executable (bar_holder matrix/bar_holder.c)
+add_executable (bar_holder kernel_module_matrix/bar_holder.c)
 
 # Vendor dispatch: CUDA and CUDA-like runtimes (NVIDIA CUDA, MetaX via the
 # MACA cu-bridge) build from cuda/*.cu; AMD builds from amd/*.hip

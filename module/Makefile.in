@@ -40,7 +40,7 @@ configure: prepare_sources
 # A failed refresh removes any stale snapshot but remains fail-open, matching
 # the module's existing PAT preflight behavior.
 refresh-pat-snapshot:
-	@sudo sh -c '\
+	@$(if $(filter 0,$(shell id -u)),,sudo) sh -c '\
 		set -eu; \
 		src="$(PAT_MEMTYPE_SOURCE)"; \
 		dst="$(PAT_MEMTYPE_SNAPSHOT)"; \
@@ -52,7 +52,7 @@ refresh-pat-snapshot:
 			exit 0; \
 		fi; \
 		tmp=$$(mktemp "$$dir/.pat_memtype_list.XXXXXX"); \
-		trap "rm -f -- '\''$$tmp'\''" EXIT HUP INT TERM; \
+		trap "rm -f -- \"$$tmp\"" EXIT HUP INT TERM; \
 		if ! cat "$$src" > "$$tmp" || [ ! -s "$$tmp" ]; then \
 			echo ">> warning: failed to capture $$src; PAT snapshot unavailable" >&2; \
 			exit 0; \

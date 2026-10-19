@@ -147,6 +147,21 @@ if compile_prog "Checking if vma_flags are modifiable directly ..."; then
         output_sym "NVFS_VM_FLAGS_NOT_CONSTANT"
 fi
 
+cat > $TEST_C <<EOF
+#include "test.h"
+#include <linux/mm.h>
+int test (void)
+{
+    struct mm_struct *mm = current->mm;
+    mmap_read_lock(mm);
+    mmap_read_unlock(mm);
+    return 0;
+}
+EOF
+if compile_prog "Checking if mmap_read_lock and mmap_read_unlock are available ..."; then
+        output_sym "PHXFS_HAVE_MMAP_READ_LOCK"
+fi
+
 # Prefer folio_mapped() on kernels that expose the folio API. Older kernels
 # may only provide page_mapcount() or page_mapped(), so probe the actual
 # headers instead of relying on a version cutoff (distributors backport APIs

@@ -241,7 +241,7 @@ static void force_release_gpu_memory(struct p2p_vmap* map)
 	p2p_vmap_put(map);  /* registered reclaim callback */
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+#ifndef PHXFS_HAVE_MMAP_READ_LOCK
 static inline void mmap_read_lock(struct mm_struct *mm) { down_read(&mm->mmap_sem); }
 static inline void mmap_read_unlock(struct mm_struct *mm) { up_read(&mm->mmap_sem); }
 #endif
